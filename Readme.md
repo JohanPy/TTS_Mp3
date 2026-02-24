@@ -3,16 +3,16 @@
 ![Python](https://img.shields.io/badge/Python-3.12%2B-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-> **Automatisez la transformation de vos articles web en épisodes de podcast audio de haute qualité.**
+> **Automatisez la transformation de vos articles web en épisodes de podcast.**
 > Ce script convertit des fichiers HTML (sauvegardés via SingleFile) en fichiers MP3 enrichis, prêts à être diffusés sur votre flux RSS personnel (Nextcloud, Audiobookshelf, etc.).
 
 ---
 
 ## ✨ Fonctionnalités
 
-- **🗣️ Synthèse Vocale Neurale (TTS)** : Utilise le moteur `edge-tts` (Voix *Vivienne Neural*) pour une qualité audio quasi-humaine.
-- **📰 Mode "Reader" Robuste & Pauses Naturelles** : Génère un texte ultra-propre et structuré pour la lecture :
-    - Extraction puissante via `Trafilatura` avec filtrage automatique du bruit (notes de bas de page académiques `[1]`, résidus de menus).
+- **🗣️ Synthèse Vocale Neurale (TTS)** : Utilise le moteur `edge-tts` (Voix *Vivienne Neural*) pour une qualité audio quasi-humaine (mais sans intonation).
+- **📰 Mode "Reader" Robuste & Pauses Naturelles** : Génère un texte plutot propre et structuré pour la lecture :
+    - Extraction via `Trafilatura` avec filtrage automatique du bruit (notes de bas de page académiques `[1]`, résidus de menus).
     - Points de suspension ` ... ` forcés entre les paragraphes pour garantir la respiration du TTS.
     - Points `.` et Virgules `,` préservés pour les pauses moyennes et courtes.
     - **Intro Scriptée** : *"Article de [Média]... [Titre]... Par [Auteur]"*.
@@ -23,10 +23,10 @@
     - **URL Source** : Ajoutée dans les commentaires `COMM`.
 
 - **✨ Architecture Modulaire (Adapters)** : Le système détecte automatiquement la source de l'article pour appliquer l'extraction la plus précise :
-    - **Générique (Reader Mode)** : Fallback surpuissant utilisant Trafilatura, fonctionnant parfaitement sur 95% des sites web.
+    - **Générique (Reader Mode)** : Fallback utilisant Trafilatura, fonctionnant sur la plupart des sites web.
     - **Gemini** : Support des exports HTML de l'IA (Markdown rendu).
     - **Europresse** : Gestion des articles de presse agrégés.
-    - **Adapters Sur-mesure** : Conservation de règles spécifiques de nettoyage profond pour certains sites (ex: *Cairn, Mediapart*).
+    - **Cairn, Mediapart, ...** : Adapters sur-mesure.
 - **clean_filename** : Renommage automatique des fichiers pour une compatibilité maximale.
 - **Archivage** : Déplace automatiquement les fichiers traités pour garder votre dossier de "Lu" propre.
 
@@ -56,7 +56,7 @@ ARCHIVE_DIR = "/chemin/vers/archives"            # Dossier d'archivage
 VOICE = "fr-FR-VivienneNeural"                   # Voix utilisée
 ```
 
-## � Utilisation
+## Utilisation
 
 Le script est conçu pour être lancé manuellement ou via une tâche planifiée (CRON).
 
