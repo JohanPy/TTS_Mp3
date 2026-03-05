@@ -11,6 +11,7 @@ from .multitudes import MultitudesAdapter
 from .manifesto import ManifestoAdapter
 from .cairn import CairnAdapter
 from .lmsi import LMSIAdapter
+from .arretsurimages import ArretSurImagesAdapter
 from .generic import GenericAdapter
 import logging
 
@@ -30,6 +31,7 @@ def get_adapter(soup, filename):
         ManifestoAdapter,
         CairnAdapter,
         LMSIAdapter,
+        ArretSurImagesAdapter,
         UCLAdapter,  # UCL uses generic selectors, should be checked last
         # Add other adapters here
     ]
