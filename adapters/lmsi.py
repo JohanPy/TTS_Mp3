@@ -71,7 +71,7 @@ class LMSIAdapter(BaseAdapter):
 
         return meta
         
-    def get_content(self):
+    def _extract_content(self):
         # The main container
         container = self.soup.select_one(".contenu-principal")
         if not container:

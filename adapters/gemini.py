@@ -56,7 +56,7 @@ class GeminiAdapter(BaseAdapter):
         return meta
 
 
-    def get_content(self):
+    def _extract_content(self):
         markdown_div = self.soup.find("div", class_="markdown")
         if not markdown_div:
             markdown_div = self.soup.find("div", class_="message-content")

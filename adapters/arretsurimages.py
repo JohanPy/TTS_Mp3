@@ -75,7 +75,7 @@ class ArretSurImagesAdapter(BaseAdapter):
 
         return meta
 
-    def get_content(self):
+    def _extract_content(self):
         """Extract the main article content specifically avoiding comments panel."""
         soup = self.soup
         

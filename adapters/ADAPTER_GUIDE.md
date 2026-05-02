@@ -36,7 +36,7 @@ class MonSiteAdapter(BaseAdapter):
         # Implémenter l'extraction
         pass
     
-    def get_content(self):
+    def _extract_content(self):
         """Retourne le texte de l'article nettoyé pour TTS"""
         # Implémenter l'extraction du contenu
         pass
@@ -216,7 +216,7 @@ def extract_metadata(self):
 ### Template complet
 
 ```python
-def get_content(self):
+def _extract_content(self):
     soup = self.soup
     
     # 1. TROUVER LE CONTENEUR PRINCIPAL
@@ -317,6 +317,8 @@ def get_content(self):
     return result
 ```
 
+> 💡 **Note sur le cache** : Vous devez implémenter `_extract_content`. La méthode publique `get_content()` est gérée par `BaseAdapter` et s'occupe de mettre le résultat en cache automatiquement pour éviter les extractions multiples (ce qui est crucial car les extractions peuvent être destructives pour le DOM).
+
 ### Le Mode "Reader" (Trafilatura)
 
 La classe `BaseAdapter` fournit désormais une méthode `self._reader_extract()` qui utilise la bibliothèque d'extraction de contenu Trafilatura. 
@@ -331,7 +333,7 @@ C'est particulièrement utile si le site a un markup imprévisible ou si l'extra
 
 1. **Extraction de tout le document (fallback)**
 ```python
-def get_content(self):
+def _extract_content(self):
     # Logique spécifique...
     if not article:
         # Fallback automatique sur l'extracteur Trafilatura
@@ -340,7 +342,7 @@ def get_content(self):
 
 2. **Extraction sur un conteneur spécifique**
 ```python
-def get_content(self):
+def _extract_content(self):
     article = self.soup.select_one('.main-article-content')
     if article:
         # Laisse Trafilatura nettoyer et parser ce conteneur précis
@@ -556,7 +558,7 @@ class BallastAdapter(BaseAdapter):
 
         return meta
         
-    def get_content(self):
+    def _extract_content(self):
         article = self.soup.find('article')
         if not article:
             return ""

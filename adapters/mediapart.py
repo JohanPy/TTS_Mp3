@@ -84,7 +84,7 @@ class MediapartAdapter(BaseAdapter):
 
         return meta
         
-    def get_content(self):
+    def _extract_content(self):
         main_content = self.soup.select_one("div.news__rich-text-content, div.content-page__full")
         
         if not main_content:

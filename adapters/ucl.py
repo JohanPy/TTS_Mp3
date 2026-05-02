@@ -95,7 +95,7 @@ class UCLAdapter(BaseAdapter):
 
         return meta
         
-    def get_content(self):
+    def _extract_content(self):
         # reader_mode (Trafilatura) provides an excellent extraction for UCL articles.
         # It successfully captures all text, formats headers correctly, and avoids duplicates.
         # We rely entirely on it for content extraction while keeping this adapter

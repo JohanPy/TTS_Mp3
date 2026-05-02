@@ -95,7 +95,7 @@ class BallastAdapter(BaseAdapter):
 
         return meta
         
-    def get_content(self):
+    def _extract_content(self):
         soup = self.soup
         
         # Find article container

@@ -42,7 +42,7 @@ class EuropresseAdapter(BaseAdapter):
             
         return meta
 
-    def get_content(self):
+    def _extract_content(self):
         # Specific selector for Europresse
         main_content = self.soup.select_one("div.DocText, div.doc-content, section.doc-content")
         

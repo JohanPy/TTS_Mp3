@@ -131,7 +131,7 @@ class ManifestoAdapter(BaseAdapter):
 
         return meta
         
-    def get_content(self):
+    def _extract_content(self):
         soup = self.soup
         
         # Manifesto XXI uses Elementor - look for text widgets

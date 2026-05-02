@@ -101,7 +101,7 @@ class MultitudesAdapter(BaseAdapter):
 
         return meta
         
-    def get_content(self):
+    def _extract_content(self):
         soup = self.soup
         
         # Find .entry-content which is the main content container

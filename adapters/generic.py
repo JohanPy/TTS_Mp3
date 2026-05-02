@@ -2,6 +2,7 @@
 from .base import BaseAdapter
 from .reader_mode import reader_extract_content, reader_extract_metadata
 from bs4 import Tag, NavigableString
+import copy
 import json
 import re
 import os
@@ -117,8 +118,10 @@ class GenericAdapter(BaseAdapter):
 
         return meta
 
-    def get_content(self):
-        soup = self.soup
+    def _extract_content(self):
+        # On travaille sur une copie pour ne pas altérer la soup originale
+        # lors de l'extraction de métadonnées ou d'appels multiples
+        soup = copy.copy(self.soup)
         html_string = str(soup)
         
         # 0. Essai via Reader Mode (Trafilatura) en priorité pour le Generic

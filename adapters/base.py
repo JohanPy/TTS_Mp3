@@ -9,6 +9,7 @@ class BaseAdapter:
     def __init__(self, soup, filename):
         self.soup = soup
         self.filename = filename
+        self._content_cache = None
 
     def can_handle(self):
         """Returns True if this adapter can handle the given soup/filename."""
@@ -30,7 +31,15 @@ class BaseAdapter:
         }
 
     def get_content(self):
-        """Returns the cleaned text content to be spoken."""
+        """Returns the cleaned text content to be spoken, using cache if available."""
+        if self._content_cache is not None:
+            return self._content_cache
+        
+        self._content_cache = self._extract_content()
+        return self._content_cache
+
+    def _extract_content(self):
+        """Returns the cleaned text content to be spoken. To be overridden by subclasses."""
         return ""
     
     def _generate_long_description(self, target_length=1200):

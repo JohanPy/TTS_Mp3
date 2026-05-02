@@ -1,6 +1,7 @@
 
 from .base import BaseAdapter
 from bs4 import Tag
+import copy
 import re
 import os
 
@@ -91,25 +92,28 @@ class LeMondeDiplomatiqueAdapter(BaseAdapter):
 
         return meta
         
-    def get_content(self):
+    def _extract_content(self):
         # Logic from original script
-        main_content = self.soup.select_one("div.texte")
-        chapo = self.soup.select_one("div.chapo")
+        # On cherche le contenu principal avec des sélecteurs robustes
+        main_content = self.soup.select_one("div.texte, .article-texte, #article-texte")
+        chapo = self.soup.select_one("div.chapo, .article-chapo, #article-chapo")
         
         container = self.soup.new_tag("div")
         
         if chapo:
-             container.append(chapo)
+             # On utilise copy() pour ne pas vider la soup originale
+             container.append(copy.copy(chapo))
         
         if main_content:
-            container.append(main_content)
+            # On utilise copy() pour ne pas vider la soup originale
+            container.append(copy.copy(main_content))
             
         if not main_content and not chapo:
             return ""
             
         # Clean-up inside the specific content
-        # (Generic cleanup might have already been done if we called a shared helper, 
-        # but here we do adapter specific stuff)
+        for unwanted in container.select("div.haucouter, div.contexte, div.signature, div.notes, div.reperes, div.encadre, figure, div.vignette"):
+            unwanted.decompose()
         
         # Pre-process: unwrap
         while True:
@@ -118,6 +122,7 @@ class LeMondeDiplomatiqueAdapter(BaseAdapter):
             wrapper.unwrap()
             
         text_parts = []
+        # Extraction des textes des paragraphes et titres
         for tag in container.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p']):
             text = tag.get_text(separator=" ", strip=True)
             if not text: continue
