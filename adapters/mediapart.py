@@ -90,6 +90,19 @@ class MediapartAdapter(BaseAdapter):
         if not main_content:
             return ""
 
+        # Handle dropcaps: they have a visual part (aria-hidden) and a reader part (screen-reader-only)
+        # We want to keep the reader part and remove the visual part to avoid fragmented reading.
+        for dropcap_wrapper in main_content.select(".dropcap-wrapper"):
+            # Remove the visual part
+            visual_part = dropcap_wrapper.select_one('[aria-hidden="true"]')
+            if visual_part:
+                visual_part.extract()
+            # The screen-reader-only part contains the full word, we want to keep it.
+            # We unwrap it so it becomes plain text and won't be removed by the next step.
+            reader_part = dropcap_wrapper.select_one(".screen-reader-only")
+            if reader_part:
+                reader_part.unwrap()
+
         # Remove "À lire aussi" blocks, accessibility hidden text, and other noise
         # Note: Do NOT remove dropcap-wrapper as it contains the first paragraph text
         for node in main_content.select(".lire-aussi, .r-interne, .read-also, .screen-reader-only, figure"): 
