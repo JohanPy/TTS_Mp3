@@ -231,6 +231,82 @@ def process_inclusive_writing(text: str) -> str:
     return result
 
 
+def convertir_chiffres_romains(texte):
+    """
+    Convertit les chiffres romains (I, V, X) en chiffres arabes dans des contextes spécifiques
+    (siècles, arrondissements, noms de souverains) pour faciliter la lecture par le TTS.
+    """
+    # Dictionnaire de base pour la conversion (limité aux I, V, X pour limiter les faux positifs)
+    def roman_to_int(s):
+        rom_val = {'I': 1, 'V': 5, 'X': 10}
+        int_val = 0
+        s = s.upper()
+        for i in range(len(s)):
+            # Ignore les caractères non romains qui auraient pu se glisser
+            if s[i] not in rom_val:
+                continue
+
+            if i > 0 and rom_val[s[i]] > rom_val[s[i - 1]]:
+                int_val += rom_val[s[i]] - 2 * rom_val[s[i - 1]]
+            else:
+                int_val += rom_val[s[i]]
+        return int_val
+
+    # 1. Règle pour les Siècles (ex: XIXe siècle, XXème siècle)
+    def replace_siecle(match):
+        roman = match.group(1)
+        mot_siecle = match.group(3)
+        val = roman_to_int(roman)
+
+        # Gestion du "premier"
+        if val == 1:
+            return f"1er {mot_siecle}"
+        return f"{val}ème {mot_siecle}"
+
+    texte = re.sub(r'\b([IVX]+)(e|ème|eme|er)?\s+(siècle|siecles|siècles)\b',
+                   replace_siecle, texte, flags=re.IGNORECASE)
+
+    # 2. Règle pour les Arrondissements (ex: XVe arrondissement, Paris XX)
+    def replace_arrond(match):
+        roman = match.group(1)
+        mot_arrond = match.group(3)
+        val = roman_to_int(roman)
+
+        if val == 1:
+            return f"1er {mot_arrond}"
+        return f"{val}ème {mot_arrond}"
+
+    texte = re.sub(r'\b([IVX]+)(e|ème|eme|er)?\s+(arrondissement|arrondissements)\b',
+                   replace_arrond, texte, flags=re.IGNORECASE)
+
+    # Cas spécifique "Paris XV" ou "Lyon III"
+    def replace_ville_arrond(match):
+        ville = match.group(1)
+        roman = match.group(2)
+        val = roman_to_int(roman)
+        return f"{ville} {val}"
+
+    texte = re.sub(r'\b(Paris|Lyon|Marseille)\s+([IVX]+)(e|ème)?\b',
+                   replace_ville_arrond, texte)
+
+    # 3. Règle pour les Rois / Papes (ex: Louis XIV, Jean-Paul II)
+    def replace_souverain(match):
+        nom = match.group(1)
+        roman = match.group(2)
+        val = roman_to_int(roman)
+
+        if val == 1:
+            return f"{nom} 1er"
+        return f"{nom} {val}"
+
+    # Liste fermée de noms courants pour éviter tout faux positif
+    noms_rois = r"(Louis|Charles|Henri|Jean|Philippe|François|Guillaume|Benoît|Paul|Pie|Jean-Paul|Napoléon|Léopold)"
+    texte = re.sub(r'\b' + noms_rois + r'\s+([IVX]+)(er|e)?\b',
+                   replace_souverain, texte)
+
+    return texte
+
+
 def clean_text_for_tts(text: str) -> str:
     """
     Nettoie le texte pour la synthèse vocale en supprimant:
@@ -360,6 +436,7 @@ def process_html_file_test(filepath, test_output_dir):
         full_content = f"{text_intro}{text_body}"
         full_content = re.sub(r'\s+', ' ', full_content).strip()
         full_content = process_inclusive_writing(full_content)  # Handle écriture inclusive
+        full_content = convertir_chiffres_romains(full_content)  # Convert Roman numerals
         full_content = clean_text_for_tts(full_content)  # Remove URLs, notes, references
 
         # Save text content to file
@@ -452,6 +529,7 @@ async def process_html_file(filepath):
         full_content = f"{text_intro}{text_body}"
         full_content = re.sub(r'\s+', ' ', full_content).strip()
         full_content = process_inclusive_writing(full_content)  # Handle écriture inclusive
+        full_content = convertir_chiffres_romains(full_content)  # Convert Roman numerals
         full_content = clean_text_for_tts(full_content)  # Remove URLs, notes, references
 
         # Generate Audio
