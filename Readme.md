@@ -11,7 +11,7 @@
 ## ✨ Fonctionnalités
 
 - **🗣️ Synthèse Vocale Neurale (TTS)** : Utilise le moteur `edge-tts` (Voix *Vivienne Neural*) pour une qualité audio quasi-humaine (mais sans intonation).
-- **📰 Mode "Reader" Robuste & Pauses Naturelles** : Génère un texte plutot propre et structuré pour la lecture :
+- **📰 Mode "Reader" Robuste & Pauses Naturelles** : Génère un texte plutôt propre et structuré pour la lecture :
     - Extraction via `Trafilatura` avec filtrage automatique du bruit (notes de bas de page académiques `[1]`, résidus de menus).
     - Points de suspension ` ... ` forcés entre les paragraphes pour garantir la respiration du TTS.
     - Points `.` et Virgules `,` préservés pour les pauses moyennes et courtes.
@@ -21,7 +21,8 @@
     - **Image de Couverture** : Récupère automatiquement l'image principale (`og:image`) et l'intègre au MP3.
     - **Description** : Ajoute le chapô/résumé dans les tags `USLT` (Lyrics).
     - **URL Source** : Ajoutée dans les commentaires `COMM`.
-
+- **📡 Suivi Automatique de Flux RSS** : Possibilité de configurer des flux RSS pour télécharger et convertir les nouveaux articles en MP3 au fur et à mesure de leur publication.
+- **✓ Initialisation Intelligente des Flux** : Lors de l'ajout d'une nouvelle URL de flux RSS, tous les articles existants de ce flux sont automatiquement marqués comme "lus" (enregistrés dans l'historique) pour éviter de convertir d'anciens contenus inutiles. Seuls les futurs articles seront traités.
 - **✨ Architecture Modulaire (Adapters)** : Le système détecte automatiquement la source de l'article pour appliquer l'extraction la plus précise :
     - **Générique (Reader Mode)** : Fallback utilisant Trafilatura, fonctionnant sur la plupart des sites web.
     - **Gemini** : Support des exports HTML de l'IA (Markdown rendu).
@@ -47,13 +48,22 @@ pip install -r requirements.txt
 
 ## ⚙️ Configuration
 
-Les chemins d'accès sont définis en haut du script `html_to_mp3.py`. Vous devez les adapter à votre environnement :
+Les chemins d'accès et options sont définis en haut du script `html_to_mp3.py`. Vous devez les adapter à votre environnement :
 
 ```python
 INPUT_DIR = "/chemin/vers/vos/articles/html"     # Dossier surveillé
 OUTPUT_DIR = "/chemin/vers/votre/dossier/podcast" # Dossier de sortie MP3
 ARCHIVE_DIR = "/chemin/vers/archives"            # Dossier d'archivage
-VOICE = "fr-FR-VivienneNeural"                   # Voix utilisée
+VOICE = "fr-FR-VivienneNeural"                   # Voix globale utilisée
+
+# Configuration des flux RSS
+PROCESSED_URLS_FILE = "processed_urls.json"      # Historique des articles convertis
+SEEN_FEEDS_FILE = "seen_feeds.json"              # Historique des flux initialisés
+RSS_FEEDS = [
+    "https://www.acrimed.org/spip.php?page=backend",
+    # On peut aussi configurer une voix spécifique par flux :
+    # {"url": "https://example.com/feed", "voice": "en-US-JennyNeural"}
+]
 ```
 
 ## Utilisation
@@ -62,11 +72,15 @@ Le script est conçu pour être lancé manuellement ou via une tâche planifiée
 
 ### Lancement manuel
 ```bash
+# Lance le traitement normal (HTML locaux + flux RSS)
 python3 html_to_mp3.py
+
+# Limiter le nombre de nouveaux articles traités par flux RSS (utile pour les tests/premiers lancements)
+python3 html_to_mp3.py --rss-limit 2
 ```
 
 ### Automatisation (CRON)
-Pour scanner le dossier toutes les heures :
+Pour scanner le dossier et les flux toutes les heures :
 ```bash
 0 * * * * /usr/bin/python3 /chemin/vers/html_to_mp3.py >> /var/log/tts_mp3.log 2>&1
 ```
