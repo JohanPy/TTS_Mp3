@@ -3,6 +3,7 @@ import os
 import shutil
 import asyncio
 import edge_tts
+import feedparser
 import logging
 import re
 import json
@@ -28,6 +29,13 @@ OUTPUT_DIR = os.path.expanduser("/home/killersky4/Documents/Perso/Podcasts/Artcl
 ARCHIVE_DIR = os.path.expanduser("/home/killersky4/Téléchargements/versaudio/Archived")
 VOICE = "fr-FR-VivienneNeural"
 CONCURRENCY_LIMIT = 3  # Safe parallel requests limit to avoid Microsoft ban/throttle
+
+# RSS configuration
+PROCESSED_URLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed_urls.json")
+SEEN_FEEDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen_feeds.json")
+RSS_FEEDS = [
+    "https://www.acrimed.org/spip.php?page=backend"
+]
 
 # --- HELPER FUNCTIONS ---
 
@@ -471,6 +479,284 @@ def process_html_file_test(filepath, test_output_dir):
         logger.error(f"[TEST MODE] Error processing {filename}: {e}", exc_info=True)
 
 
+def load_processed_urls():
+    """Loads the set of already processed RSS article URLs."""
+    if os.path.exists(PROCESSED_URLS_FILE):
+        try:
+            with open(PROCESSED_URLS_FILE, 'r', encoding='utf-8') as f:
+                return set(json.load(f))
+        except Exception as e:
+            logger.warning(f"Failed to load processed URLs: {e}")
+    return set()
+
+
+def save_processed_url(url):
+    """Saves a processed RSS article URL to the history file."""
+    save_processed_urls([url])
+
+
+def save_processed_urls(new_urls):
+    """Saves multiple processed RSS article URLs to the history file at once."""
+    urls = load_processed_urls()
+    urls.update(new_urls)
+    try:
+        temp_file = PROCESSED_URLS_FILE + ".tmp"
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(list(urls), f, indent=4)
+        os.replace(temp_file, PROCESSED_URLS_FILE)
+    except Exception as e:
+        logger.error(f"Failed to save processed URLs: {e}")
+
+
+def load_seen_feeds():
+    """Loads the set of already initialized RSS feed URLs."""
+    if os.path.exists(SEEN_FEEDS_FILE):
+        try:
+            with open(SEEN_FEEDS_FILE, 'r', encoding='utf-8') as f:
+                return set(json.load(f))
+        except Exception as e:
+            logger.warning(f"Failed to load seen feeds: {e}")
+    return set()
+
+
+def save_seen_feed(feed_url):
+    """Saves an initialized RSS feed URL to the history file."""
+    feeds = load_seen_feeds()
+    feeds.add(feed_url)
+    try:
+        temp_file = SEEN_FEEDS_FILE + ".tmp"
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(list(feeds), f, indent=4)
+        os.replace(temp_file, SEEN_FEEDS_FILE)
+    except Exception as e:
+        logger.error(f"Failed to save seen feeds: {e}")
+
+
+async def generate_audio_from_content(meta, text_body, mp3_path, voice=VOICE):
+    """
+    Generates an MP3 file from clean text and metadata, and sets ID3 tags.
+    Returns True if generation was successful, False otherwise.
+    """
+    title = meta.get('title') or 'Unknown Title'
+    author = meta.get('author') or 'Unknown Author'
+    media = meta.get('media') or 'Unknown Media'
+    
+    # Construct intro
+    text_intro = (
+        f"Article de {media}... "
+        f"{title}... "
+        f"Par {author}... "
+    )
+
+    full_content = f"{text_intro}{text_body}"
+    full_content = re.sub(r'\s+', ' ', full_content).strip()
+    full_content = process_inclusive_writing(full_content)  # Handle écriture inclusive
+    full_content = convertir_chiffres_romains(full_content)  # Convert Roman numerals
+    full_content = clean_text_for_tts(full_content)  # Remove URLs, notes, references
+
+    if len(full_content) < 50:
+        logger.warning(f"Skipping generation for '{title}': content too short or empty.")
+        return False
+
+    # Generate Audio
+    logger.info(f"Generating MP3: {os.path.basename(mp3_path)}")
+    logger.debug(f"Content Preview: {full_content[:100]}...")
+    
+    try:
+        communicate = edge_tts.Communicate(full_content, voice)
+        await communicate.save(mp3_path)
+    except Exception as e:
+        logger.error(f"Failed to generate TTS audio for '{title}': {e}")
+        return False
+    
+    # Add ID3 Tags
+    try:
+        try:
+            audio = ID3(mp3_path)
+        except Exception:
+            audio = ID3()
+            
+        audio.add(TIT2(encoding=3, text=title))
+        audio.add(TPE1(encoding=3, text=author))
+        
+        album = media if media != "Unknown Media" else "Audio Articles"
+        audio.add(TALB(encoding=3, text=album))
+        
+        if meta.get('url'):
+            audio.add(COMM(encoding=3, lang='eng', desc='', text=meta['url']))
+        
+        if meta.get('description'):
+            audio.add(USLT(encoding=3, lang='eng', desc='Description', text=meta['description']))
+            
+        if meta.get('date'):
+            # Extract year only for TDRC tag
+            date_str = str(meta['date'])
+            year_match = re.match(r'^(\d{4})', date_str)
+            if year_match:
+                audio.add(TDRC(encoding=3, text=year_match.group(1)))
+
+        if meta.get('image_url'):
+            img_data = download_image(meta['image_url'])
+            if img_data:
+                mime = 'image/jpeg'
+                if meta['image_url'].lower().endswith('.png'):
+                    mime = 'image/png'
+                audio.add(APIC(
+                    encoding=3,
+                    mime=mime,
+                    type=3, 
+                    desc=u'Cover',
+                    data=img_data
+                ))
+        
+        audio.save(mp3_path)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to write ID3 tags to {mp3_path}: {e}")
+        # Return True because the audio file was successfully generated
+        return True
+
+
+async def process_rss_feed(feed_config, processed_urls, limit=None):
+    """
+    Processes an RSS feed, downloading new articles and converting them to MP3.
+    """
+    if isinstance(feed_config, str):
+        feed_url = feed_config
+        feed_voice = VOICE
+    elif isinstance(feed_config, dict):
+        feed_url = feed_config.get("url")
+        feed_voice = feed_config.get("voice", VOICE)
+    else:
+        logger.error(f"Invalid feed configuration: {feed_config}")
+        return
+
+    logger.info(f"Checking RSS Feed: {feed_url}")
+    try:
+        loop = asyncio.get_event_loop()
+        feed = await loop.run_in_executor(None, feedparser.parse, feed_url)
+    except Exception as e:
+        logger.error(f"Failed to parse RSS feed {feed_url}: {e}")
+        return
+
+    entries = feed.entries
+    if not entries:
+        logger.info(f"No entries found in feed {feed_url}")
+        return
+
+    # Check if this feed is new to initialize it by marking all current items as read
+    seen_feeds = load_seen_feeds()
+    if feed_url not in seen_feeds:
+        logger.info(f"New RSS Feed detected: {feed_url}. Initializing feed by marking all current entries as read...")
+        links_to_save = []
+        for entry in entries:
+            link = entry.get("link")
+            if link:
+                links_to_save.append(link)
+                processed_urls.add(link)
+        if links_to_save:
+            save_processed_urls(links_to_save)
+        logger.info(f"Marked {len(links_to_save)} existing articles from {feed_url} as read.")
+        save_seen_feed(feed_url)
+        return
+
+    # Filter out already processed entries
+    new_entries = []
+    for entry in entries:
+        link = entry.get("link")
+        if not link:
+            continue
+        if link not in processed_urls:
+            new_entries.append(entry)
+
+    if not new_entries:
+        logger.info(f"No new entries in feed {feed_url}")
+        return
+
+    # If limit is set, we only keep the N latest entries
+    if limit is not None:
+        new_entries = new_entries[:limit]
+        logger.info(f"Limiting to {len(new_entries)} latest articles for RSS feed.")
+
+    logger.info(f"Found {len(new_entries)} new entries to process from {feed_url}")
+
+    # Process each new entry
+    for entry in new_entries:
+        link = entry.get("link")
+        title = entry.get("title", "Untitled Article")
+        
+        logger.info(f"Processing RSS Entry: {title} ({link})")
+        
+        try:
+            # Download article HTML
+            def fetch_html(url):
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    return response.read()
+            
+            html_bytes = await loop.run_in_executor(None, fetch_html, link)
+            soup = BeautifulSoup(html_bytes, 'html.parser')
+            
+            # Use article title as filename hint
+            filename_hint = clean_filename(title) + ".html"
+            
+            # Get Adapter
+            adapter = get_adapter(soup, filename_hint)
+            
+            # Extract metadata and merge/override with RSS data
+            meta = adapter.extract_metadata()
+            
+            if title:
+                meta["title"] = title
+            if link:
+                meta["url"] = link
+                
+            # If date is missing, try to extract from entry
+            if not meta.get("date") and entry.get("published_parsed"):
+                tm = entry.published_parsed
+                meta["date"] = f"{tm.tm_year:04d}-{tm.tm_mon:02d}-{tm.tm_mday:02d}"
+                
+            # If description is missing, use summary
+            if not meta.get("description") and entry.get("summary"):
+                summary_soup = BeautifulSoup(entry.summary, 'html.parser')
+                meta["description"] = summary_soup.get_text()
+
+            # Clean name for output file
+            safe_title = clean_filename(meta["title"])
+            media = meta.get("media", "Unknown Media")
+            safe_media = clean_filename(media)
+            
+            if safe_media and safe_media != "Unknown_Media":
+                mp3_name = f"{safe_title} - {safe_media}.mp3"
+            else:
+                mp3_name = f"{safe_title}.mp3"
+                
+            if len(mp3_name) > 200:
+                mp3_name = mp3_name[:200] + ".mp3"
+                
+            mp3_path = os.path.join(OUTPUT_DIR, mp3_name)
+            
+            # Generate body content
+            text_body = adapter.get_content()
+            if len(text_body) < 50:
+                logger.warning(f"Skipping RSS entry '{title}': content too short or empty.")
+                save_processed_url(link)
+                processed_urls.add(link)
+                continue
+                
+            # Generate MP3 and save tags
+            success = await generate_audio_from_content(meta, text_body, mp3_path, feed_voice)
+            if success:
+                logger.info(f"Successfully converted RSS article to MP3: {mp3_path}")
+                save_processed_url(link)
+                processed_urls.add(link)
+            else:
+                logger.error(f"Failed to generate MP3 for RSS article: {title}")
+                
+        except Exception as e:
+            logger.error(f"Error processing RSS entry '{title}': {e}", exc_info=True)
+
+
 async def process_html_file(filepath):
     filename = os.path.basename(filepath)
     logger.info(f"Processing: {filename}")
@@ -520,69 +806,11 @@ async def process_html_file(filepath):
             logger.warning(f"Skipping {filename}: content too short or empty.")
             return 
 
-        # Construct intro
-        text_intro = (
-            f"Article de {media}... "
-            f"{title}... "
-            f"Par {author}... "
-        )
+        # Generate Audio and tags
+        success = await generate_audio_from_content(meta, text_body, mp3_path, VOICE)
+        if not success:
+            return
 
-        full_content = f"{text_intro}{text_body}"
-        full_content = re.sub(r'\s+', ' ', full_content).strip()
-        full_content = process_inclusive_writing(full_content)  # Handle écriture inclusive
-        full_content = convertir_chiffres_romains(full_content)  # Convert Roman numerals
-        full_content = clean_text_for_tts(full_content)  # Remove URLs, notes, references
-
-        # Generate Audio
-        logger.info(f"Generating MP3: {mp3_name}")
-        logger.debug(f"Content Preview: {full_content[:100]}...")
-        
-        communicate = edge_tts.Communicate(full_content, VOICE)
-        await communicate.save(mp3_path)
-        
-        # Add ID3 Tags
-        try:
-            audio = ID3(mp3_path)
-        except Exception:
-            audio = ID3()
-            
-        audio.add(TIT2(encoding=3, text=title))
-        audio.add(TPE1(encoding=3, text=author))
-        
-        album = media if media != "Unknown Media" else "Audio Articles"
-        audio.add(TALB(encoding=3, text=album))
-        
-        if meta['url']:
-            audio.add(COMM(encoding=3, lang='eng', desc='', text=meta['url']))
-        
-        if meta['description']:
-            audio.add(USLT(encoding=3, lang='eng', desc='Description', text=meta['description']))
-            
-        if meta['date']:
-            # Extract year only for TDRC tag (full ISO format like "2024-03-14T15:32" 
-            # can cause issues with podcast readers)
-            date_str = str(meta['date'])
-            # Try to extract just the year
-            year_match = re.match(r'^(\d{4})', date_str)
-            if year_match:
-                audio.add(TDRC(encoding=3, text=year_match.group(1)))
-
-        if meta['image_url']:
-            img_data = download_image(meta['image_url'])
-            if img_data:
-                mime = 'image/jpeg'
-                if meta['image_url'].lower().endswith('.png'):
-                    mime = 'image/png'
-                audio.add(APIC(
-                    encoding=3,
-                    mime=mime,
-                    type=3, 
-                    desc=u'Cover',
-                    data=img_data
-                ))
-        
-        audio.save(mp3_path)
-        
         logger.info(f"Generated successfully with tags: {mp3_path}")
 
         # Archive and Cleanup
@@ -650,7 +878,7 @@ def main_test(test_dir):
         logger.info("=" * 80)
 
 
-async def main():
+async def main(rss_limit=None):
     # Ensure directories exist
     for directory in [INPUT_DIR, OUTPUT_DIR, ARCHIVE_DIR]:
         if not os.path.exists(directory):
@@ -660,13 +888,13 @@ async def main():
                 logger.error(f"Could not create directory {directory}: {e}")
                 return
 
-    logger.info("Starting scan...")
-    
+    # --- PROCESS LOCAL HTML FILES ---
+    logger.info("Starting scan for local HTML files...")
     try:
         files = sorted(os.listdir(INPUT_DIR))
     except FileNotFoundError:
         logger.error(f"Input directory not found: {INPUT_DIR}")
-        return
+        files = []
 
     html_files = []
     for file in files:
@@ -679,22 +907,30 @@ async def main():
         if file.lower().endswith(".html") or file.lower().endswith(".htm"):
             html_files.append(filepath)
     
-    if not html_files:
-        logger.info("No new HTML files found.")
-        return
+    if html_files:
+        logger.info(f"Found {len(html_files)} HTML file(s) to process.")
+        # Use a semaphore to process multiple files in parallel safely
+        sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        
+        async def safe_process(filepath):
+            async with sem:
+                await process_html_file(filepath)
+                
+        tasks = [safe_process(filepath) for filepath in html_files]
+        await asyncio.gather(*tasks)
+        logger.info("All local HTML files processed.")
+    else:
+        logger.info("No new local HTML files found.")
 
-    logger.info(f"Found {len(html_files)} HTML file(s) to process.")
-    
-    # Use a semaphore to process multiple files in parallel safely
-    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    
-    async def safe_process(filepath):
-        async with sem:
-            await process_html_file(filepath)
-            
-    tasks = [safe_process(filepath) for filepath in html_files]
-    await asyncio.gather(*tasks)
-    logger.info("All HTML files processed.")
+    # --- PROCESS RSS FEEDS ---
+    if RSS_FEEDS:
+        logger.info("Starting RSS feeds processing...")
+        processed_urls = load_processed_urls()
+        for feed_config in RSS_FEEDS:
+            await process_rss_feed(feed_config, processed_urls, limit=rss_limit)
+        logger.info("All RSS feeds processed.")
+    else:
+        logger.info("No RSS feeds configured.")
 
 if __name__ == "__main__":
     # Parse command line arguments
@@ -713,6 +949,12 @@ if __name__ == "__main__":
              'Les fichiers HTML sont lus depuis Article-Test/ et les fichiers '
              'texte sont créés dans le même dossier.'
     )
+    parser.add_argument(
+        '--rss-limit',
+        type=int,
+        default=None,
+        help='Limite le nombre de nouveaux articles à traiter par flux RSS (utile pour les tests).'
+    )
     
     args = parser.parse_args()
     
@@ -726,6 +968,6 @@ if __name__ == "__main__":
             main_test(test_dir)
         else:
             # Normal mode: async execution
-            asyncio.run(main())
+            asyncio.run(main(rss_limit=args.rss_limit))
     except KeyboardInterrupt:
         logger.info("Stopped by user.")

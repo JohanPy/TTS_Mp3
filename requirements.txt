@@ -3,3 +3,4 @@ edge-tts>=6.1.9
 mutagen>=1.47.0
 requests>=2.31.0
 trafilatura>=2.0.0
+feedparser>=6.0.10
