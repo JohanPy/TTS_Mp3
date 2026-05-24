@@ -27,6 +27,7 @@ INPUT_DIR = os.path.expanduser("/home/killersky4/Téléchargements/versaudio")
 OUTPUT_DIR = os.path.expanduser("/home/killersky4/Documents/Perso/Podcasts/ArtcleTTS")
 ARCHIVE_DIR = os.path.expanduser("/home/killersky4/Téléchargements/versaudio/Archived")
 VOICE = "fr-FR-VivienneNeural"
+CONCURRENCY_LIMIT = 3  # Safe parallel requests limit to avoid Microsoft ban/throttle
 
 # --- HELPER FUNCTIONS ---
 
@@ -654,13 +655,12 @@ async def main():
     for directory in [INPUT_DIR, OUTPUT_DIR, ARCHIVE_DIR]:
         if not os.path.exists(directory):
             try:
-                os.makedirs(directory)
+                os.makedirs(directory, exist_ok=True)
             except OSError as e:
                 logger.error(f"Could not create directory {directory}: {e}")
                 return
 
     logger.info("Starting scan...")
-    files_found = False
     
     try:
         files = sorted(os.listdir(INPUT_DIR))
@@ -668,6 +668,7 @@ async def main():
         logger.error(f"Input directory not found: {INPUT_DIR}")
         return
 
+    html_files = []
     for file in files:
         filepath = os.path.join(INPUT_DIR, file)
         
@@ -676,11 +677,24 @@ async def main():
         if file.endswith('.part') or file.endswith('.tmp') or file.endswith('.crdownload'): continue
         
         if file.lower().endswith(".html") or file.lower().endswith(".htm"):
-            files_found = True
-            await process_html_file(filepath)
+            html_files.append(filepath)
     
-    if not files_found:
+    if not html_files:
         logger.info("No new HTML files found.")
+        return
+
+    logger.info(f"Found {len(html_files)} HTML file(s) to process.")
+    
+    # Use a semaphore to process multiple files in parallel safely
+    sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    
+    async def safe_process(filepath):
+        async with sem:
+            await process_html_file(filepath)
+            
+    tasks = [safe_process(filepath) for filepath in html_files]
+    await asyncio.gather(*tasks)
+    logger.info("All HTML files processed.")
 
 if __name__ == "__main__":
     # Parse command line arguments
