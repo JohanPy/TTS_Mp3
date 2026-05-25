@@ -34,7 +34,8 @@ CONCURRENCY_LIMIT = 3  # Safe parallel requests limit to avoid Microsoft ban/thr
 PROCESSED_URLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed_urls.json")
 SEEN_FEEDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen_feeds.json")
 RSS_FEEDS = [
-    "https://www.acrimed.org/spip.php?page=backend"
+    "https://www.acrimed.org/spip.php?page=backend",
+    "https://www.unioncommunistelibertaire.org/spip.php?page=backend&"
 ]
 
 # --- HELPER FUNCTIONS ---
