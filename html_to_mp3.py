@@ -47,6 +47,17 @@ def clean_filename(text):
     safe_text = re.sub(r'[\s_-]+', '_', safe_text)
     return safe_text
 
+def limit_filename(filename, max_length=120):
+    """Truncates a filename to not exceed max_length while preserving its extension."""
+    if len(filename) <= max_length:
+        return filename
+    name, ext = os.path.splitext(filename)
+    ext_len = len(ext)
+    max_name_len = max_length - ext_len
+    if max_name_len <= 0:
+        return filename[:max_length]
+    return name[:max_name_len] + ext
+
 def is_hidden(element):
     """Checks if an element is likely hidden via inline style."""
     if isinstance(element, Tag):
@@ -422,9 +433,8 @@ def process_html_file_test(filepath, test_output_dir):
         else:
             txt_name = f"{safe_title}.txt"
         
-        # Limit length
-        if len(txt_name) > 200:
-            txt_name = txt_name[:200] + ".txt"
+        # Limit length to 120 characters to avoid sync issues (e.g. with Nextcloud)
+        txt_name = limit_filename(txt_name, 120)
 
         txt_path = os.path.join(test_output_dir, txt_name)
 
@@ -731,8 +741,8 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
             else:
                 mp3_name = f"{safe_title}.mp3"
                 
-            if len(mp3_name) > 200:
-                mp3_name = mp3_name[:200] + ".mp3"
+            # Limit length to 120 characters to avoid sync issues (e.g. with Nextcloud)
+            mp3_name = limit_filename(mp3_name, 120)
                 
             mp3_path = os.path.join(OUTPUT_DIR, mp3_name)
             
@@ -793,9 +803,8 @@ async def process_html_file(filepath):
         else:
             mp3_name = f"{safe_title}.mp3"
         
-        # Limit length
-        if len(mp3_name) > 200:
-            mp3_name = mp3_name[:200] + ".mp3"
+        # Limit length to 120 characters to avoid sync issues (e.g. with Nextcloud)
+        mp3_name = limit_filename(mp3_name, 120)
 
         mp3_path = os.path.join(OUTPUT_DIR, mp3_name)
 
