@@ -26,33 +26,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
-INPUT_DIR = os.path.expanduser("~/Téléchargements/versaudio")
-OUTPUT_DIR = os.path.expanduser("~/Documents/Perso/Podcasts/ArtcleTTS")
-ARCHIVE_DIR = os.path.expanduser("~/Téléchargements/versaudio/Archived")
-VOICE = "fr-FR-VivienneNeural"
-CONCURRENCY_LIMIT = 3  # Safe parallel requests limit to avoid Microsoft ban/throttle
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_CONFIG_FILE = os.path.join(_BASE_DIR, "config.json")
+_CONFIG_EXAMPLE = os.path.join(_BASE_DIR, "config.example.json")
 
-# RSS configuration
-PROCESSED_URLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed_urls.json")
-SEEN_FEEDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen_feeds.json")
-GROUPED_SUMMARIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grouped_summaries.json")
-RSS_FEEDS = [
-    "https://www.acrimed.org/spip.php?page=backend",
-    "https://www.unioncommunistelibertaire.org/spip.php?page=backend&",
-    # Exemple de flux avec résumé IA et regroupement par jour :
-    # {
-    #     "url": "http://www.developpez.com/index/rss",
-    #     "voice": "fr-FR-VivienneNeural",
-    #     "summarize": True,       # Active le résumé IA (gemini_config.json)
-    #     "group_window_hours": 24 # Regroupe tous les résumés du jour en 1 MP3
-    # }
-    {
-        "url": "http://www.developpez.com/index/rss",
-        "voice": "fr-FR-VivienneNeural",
-        "summarize": True,
-        "group_window_hours": 24
-    }
-]
+
+def _load_config() -> dict:
+    """
+    Charge la configuration depuis config.json.
+    Lève une erreur explicite si le fichier est absent.
+    """
+    if not os.path.exists(_CONFIG_FILE):
+        raise FileNotFoundError(
+            f"Fichier de configuration manquant : {_CONFIG_FILE}\n"
+            f"Copiez {_CONFIG_EXAMPLE} vers {_CONFIG_FILE} et adaptez-le."
+        )
+    with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+_cfg = _load_config()
+
+INPUT_DIR = os.path.expanduser(_cfg.get("input_dir", "~/Téléchargements/versaudio"))
+OUTPUT_DIR = os.path.expanduser(_cfg.get("output_dir", "~/Documents/Perso/Podcasts/ArtcleTTS"))
+ARCHIVE_DIR = os.path.expanduser(_cfg.get("archive_dir", "~/Téléchargements/versaudio/Archived"))
+VOICE = _cfg.get("voice", "fr-FR-VivienneNeural")
+CONCURRENCY_LIMIT = int(_cfg.get("concurrency_limit", 3))
+RSS_FEEDS = _cfg.get("rss_feeds", [])
+
+# Fichiers de persistance (état local, non versionnés)
+PROCESSED_URLS_FILE = os.path.join(_BASE_DIR, "processed_urls.json")
+SEEN_FEEDS_FILE = os.path.join(_BASE_DIR, "seen_feeds.json")
+GROUPED_SUMMARIES_FILE = os.path.join(_BASE_DIR, "grouped_summaries.json")
 
 # --- HELPER FUNCTIONS ---
 

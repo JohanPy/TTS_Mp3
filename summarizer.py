@@ -37,23 +37,38 @@ def load_gemini_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
     """
     Charge la configuration Gemini depuis un fichier JSON.
 
+    La clé API peut être surchargée via la variable d'environnement GEMINI_API_KEY,
+    ce qui évite de stocker des secrets dans un fichier.
+
     Raises:
         FileNotFoundError: si le fichier de configuration est absent.
-        ValueError: si des clés obligatoires manquent.
+        ValueError: si des clés obligatoires manquent ou si la clé API est un placeholder.
     """
     if not os.path.exists(config_path):
         raise FileNotFoundError(
             f"Fichier de configuration Gemini introuvable : {config_path}\n"
-            "Créez gemini_config.json avec les clés : api_key, model, prompt, max_requests_per_minute"
+            "Copiez gemini_config.example.json vers gemini_config.json et renseignez vos paramètres.\n"
+            "Vous pouvez aussi définir la variable d'environnement GEMINI_API_KEY."
         )
 
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
+    # La variable d'environnement prend la priorité sur le fichier
+    env_key = os.environ.get("GEMINI_API_KEY")
+    if env_key:
+        config["api_key"] = env_key
+
     required_keys = ("api_key", "model", "prompt", "max_requests_per_minute")
     missing = [k for k in required_keys if k not in config]
     if missing:
         raise ValueError(f"Clés manquantes dans gemini_config.json : {missing}")
+
+    if config.get("api_key") in ("", "VOTRE_CLE_API_GEMINI"):
+        raise ValueError(
+            "La clé API Gemini n'est pas configurée.\n"
+            "Définissez GEMINI_API_KEY en variable d'environnement ou renseignez api_key dans gemini_config.json."
+        )
 
     rpm = config["max_requests_per_minute"]
     if not isinstance(rpm, (int, float)) or rpm <= 0 or rpm > 15:
