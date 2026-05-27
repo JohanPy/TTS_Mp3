@@ -9,10 +9,12 @@ import re
 import json
 import glob
 import argparse
+from datetime import date
 from bs4 import BeautifulSoup, Tag, NavigableString
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, COMM, USLT, TDRC, APIC
 import urllib.request
 import urllib.error
+from summarizer import get_summarizer
 
 
 # --- LOGGING SETUP ---
@@ -24,18 +26,32 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
-INPUT_DIR = os.path.expanduser("/home/killersky4/Téléchargements/versaudio")
-OUTPUT_DIR = os.path.expanduser("/home/killersky4/Documents/Perso/Podcasts/ArtcleTTS")
-ARCHIVE_DIR = os.path.expanduser("/home/killersky4/Téléchargements/versaudio/Archived")
+INPUT_DIR = os.path.expanduser("~/Téléchargements/versaudio")
+OUTPUT_DIR = os.path.expanduser("~/Documents/Perso/Podcasts/ArtcleTTS")
+ARCHIVE_DIR = os.path.expanduser("~/Téléchargements/versaudio/Archived")
 VOICE = "fr-FR-VivienneNeural"
 CONCURRENCY_LIMIT = 3  # Safe parallel requests limit to avoid Microsoft ban/throttle
 
 # RSS configuration
 PROCESSED_URLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed_urls.json")
 SEEN_FEEDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen_feeds.json")
+GROUPED_SUMMARIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grouped_summaries.json")
 RSS_FEEDS = [
     "https://www.acrimed.org/spip.php?page=backend",
-    "https://www.unioncommunistelibertaire.org/spip.php?page=backend&"
+    "https://www.unioncommunistelibertaire.org/spip.php?page=backend&",
+    # Exemple de flux avec résumé IA et regroupement par jour :
+    # {
+    #     "url": "http://www.developpez.com/index/rss",
+    #     "voice": "fr-FR-VivienneNeural",
+    #     "summarize": True,       # Active le résumé IA (gemini_config.json)
+    #     "group_window_hours": 24 # Regroupe tous les résumés du jour en 1 MP3
+    # }
+    {
+        "url": "http://www.developpez.com/index/rss",
+        "voice": "fr-FR-VivienneNeural",
+        "summarize": True,
+        "group_window_hours": 24
+    }
 ]
 
 # --- HELPER FUNCTIONS ---
@@ -375,6 +391,26 @@ def clean_text_for_tts(text: str) -> str:
     # 8. Supprimer les mentions "Paru dans..." "Articles du même auteur"
     result = re.sub(r'Paru dans[^\.]+\.', '', result, flags=re.IGNORECASE)
     result = re.sub(r'Articles? du même auteur\.?', '', result, flags=re.IGNORECASE)
+
+    # 9. Supprimer les sections interactives et boilerplate des sites d'actu
+    #    (développez.com, presse générale…)
+    # Couper au premier marqueur de section parasite
+    noise_cutoff_patterns = [
+        r'"Et vous\s*\?"',          # developpez.com forum
+        r'"Et vous aussi"',
+        r'"Voir aussi"',            # liens connexes
+        r'Voir aussi\s*:',
+        r'Vous avez lu gratuitement',  # paywall/abonnement
+        r'Soutenez le club',
+        r'en souscrivant un abonnement',
+        r'Donnez votre avis',
+        r'Réagissez à cet article',
+        r'Laisser un commentaire',
+    ]
+    for pattern in noise_cutoff_patterns:
+        m = re.search(pattern, result, flags=re.IGNORECASE)
+        if m:
+            result = result[:m.start()]
     
     # 9. Supprimer les notes numérotées en début de phrase
     # Pattern: "1 Texte de la note..." "2 Autre note..."
@@ -628,6 +664,159 @@ async def generate_audio_from_content(meta, text_body, mp3_path, voice=VOICE):
         return True
 
 
+# --- GROUPED SUMMARIES (résumés IA regroupés en 1 MP3 par fenêtre calendaire) ---
+
+def load_grouped_summaries() -> dict:
+    """Charge le fichier grouped_summaries.json. Retourne {"pending": []} si absent."""
+    if os.path.exists(GROUPED_SUMMARIES_FILE):
+        try:
+            with open(GROUPED_SUMMARIES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Impossible de lire grouped_summaries.json : {e}")
+    return {"pending": []}
+
+
+def save_grouped_summaries(data: dict) -> None:
+    """Sauvegarde grouped_summaries.json de façon atomique."""
+    try:
+        temp_file = GROUPED_SUMMARIES_FILE + ".tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        os.replace(temp_file, GROUPED_SUMMARIES_FILE)
+    except Exception as e:
+        logger.error(f"Impossible de sauvegarder grouped_summaries.json : {e}")
+
+
+def store_pending_summary(
+    feed_url: str,
+    media: str,
+    title: str,
+    article_url: str,
+    summary: str,
+    window_hours: int,
+    voice: str,
+) -> None:
+    """
+    Ajoute un résumé dans la liste d'attente grouped_summaries.json.
+    Le date_bucket est la date courante ISO (ex. "2026-05-27").
+    """
+    data = load_grouped_summaries()
+    entry = {
+        "feed_url": feed_url,
+        "media": media,
+        "title": title,
+        "article_url": article_url,
+        "summary": summary,
+        "date_bucket": date.today().isoformat(),
+        "window_hours": window_hours,
+        "voice": voice,
+    }
+    data["pending"].append(entry)
+    save_grouped_summaries(data)
+    logger.debug(f"Résumé mis en attente de regroupement : {title[:60]}")
+
+
+def _build_grouped_text(media: str, date_bucket: str, entries: list) -> str:
+    """Construit le texte complet du MP3 groupé à partir de la liste de résumés."""
+    n = len(entries)
+    ordinals = [
+        "Premier", "Deuxième", "Troisième", "Quatrième", "Cinquième",
+        "Sixième", "Septième", "Huitième", "Neuvième", "Dixième",
+    ]
+
+    parts = [f"Résumés {media} du {date_bucket}. {n} article{'s' if n > 1 else ''}. "]
+    for i, entry in enumerate(entries):
+        title = entry.get("title", "Sans titre")
+        summary = entry.get("summary", "")
+        if i < len(ordinals):
+            label = f"{ordinals[i]} article sur {n}"
+        else:
+            label = f"Article {i + 1} sur {n}"
+        parts.append(f"{label} : {title}. {summary}")
+
+    return " ".join(parts)
+
+
+async def flush_grouped_summaries() -> None:
+    """
+    Génère les MP3 groupés pour toutes les fenêtres calendaires fermées
+    (date_bucket strictement antérieure à aujourd'hui).
+
+    Les entrées traitées sont retirées de grouped_summaries.json.
+    """
+    data = load_grouped_summaries()
+    pending = data.get("pending", [])
+    if not pending:
+        return
+
+    today_str = date.today().isoformat()
+
+    # Grouper les entrées par (feed_url, date_bucket)
+    groups: dict = {}
+    remaining: list = []
+
+    for entry in pending:
+        bucket = entry.get("date_bucket", "")
+        if bucket < today_str:
+            key = (entry["feed_url"], bucket)
+            groups.setdefault(key, []).append(entry)
+        else:
+            remaining.append(entry)
+
+    if not groups:
+        logger.debug("flush_grouped_summaries : aucune fenêtre fermée à traiter.")
+        return
+
+    for (feed_url, date_bucket), entries in groups.items():
+        media = entries[0].get("media", "Unknown Media")
+        voice = entries[0].get("voice", VOICE)
+
+        safe_media = clean_filename(media)
+        mp3_name = f"Resumes_{safe_media}_{date_bucket}.mp3"
+        mp3_name = limit_filename(mp3_name, 120)
+        mp3_path = os.path.join(OUTPUT_DIR, mp3_name)
+
+        logger.info(
+            f"Génération du MP3 groupé : {mp3_name} ({len(entries)} article(s))"
+        )
+
+        combined_text = _build_grouped_text(media, date_bucket, entries)
+        combined_text = clean_text_for_tts(combined_text)
+
+        if len(combined_text) < 20:
+            logger.warning(f"Texte groupé trop court pour {mp3_name}, ignoré.")
+            remaining.extend(entries)
+            continue
+
+        try:
+            communicate = edge_tts.Communicate(combined_text, voice)
+            await communicate.save(mp3_path)
+        except Exception as e:
+            logger.error(f"Erreur TTS pour le MP3 groupé {mp3_name} : {e}")
+            remaining.extend(entries)
+            continue
+
+        # Tags ID3 du MP3 groupé
+        try:
+            try:
+                audio = ID3(mp3_path)
+            except Exception:
+                audio = ID3()
+            audio.add(TIT2(encoding=3, text=f"Résumés {media} du {date_bucket}"))
+            audio.add(TPE1(encoding=3, text="IA Résumé"))
+            audio.add(TALB(encoding=3, text=media))
+            audio.save(mp3_path)
+        except Exception as e:
+            logger.warning(f"Impossible d'écrire les tags ID3 pour {mp3_name} : {e}")
+
+        logger.info(f"MP3 groupé généré avec succès : {mp3_path}")
+
+    # Sauvegarder uniquement les entrées non traitées
+    data["pending"] = remaining
+    save_grouped_summaries(data)
+
+
 async def process_rss_feed(feed_config, processed_urls, limit=None):
     """
     Processes an RSS feed, downloading new articles and converting them to MP3.
@@ -635,9 +824,13 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
     if isinstance(feed_config, str):
         feed_url = feed_config
         feed_voice = VOICE
+        should_summarize = False
+        group_window_hours = None
     elif isinstance(feed_config, dict):
         feed_url = feed_config.get("url")
         feed_voice = feed_config.get("voice", VOICE)
+        should_summarize = bool(feed_config.get("summarize", False))
+        group_window_hours = feed_config.get("group_window_hours")
     else:
         logger.error(f"Invalid feed configuration: {feed_config}")
         return
@@ -754,7 +947,33 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
                 save_processed_url(link)
                 processed_urls.add(link)
                 continue
-                
+
+            # --- RÉSUMÉ IA (optionnel, configuré par flux) ---
+            if should_summarize:
+                logger.info(f"Résumé IA activé pour '{title[:60]}' ({len(text_body)} chars)")
+                summarizer = get_summarizer()
+                text_body = await summarizer.summarize(text_body)
+
+                if group_window_hours:
+                    # Accumuler dans grouped_summaries.json, pas de MP3 individuel
+                    store_pending_summary(
+                        feed_url=feed_url,
+                        media=meta.get("media", "Unknown Media"),
+                        title=meta["title"],
+                        article_url=link,
+                        summary=text_body,
+                        window_hours=group_window_hours,
+                        voice=feed_voice,
+                    )
+                    save_processed_url(link)
+                    processed_urls.add(link)
+                    logger.info(
+                        f"Résumé mis en attente (groupe {group_window_hours}h) : {title[:60]}"
+                    )
+                    continue
+                # else : text_body est maintenant le résumé → génération MP3 individuelle normale
+            # --- FIN RÉSUMÉ IA ---
+
             # Generate MP3 and save tags
             success = await generate_audio_from_content(meta, text_body, mp3_path, feed_voice)
             if success:
@@ -939,6 +1158,9 @@ async def main(rss_limit=None):
         for feed_config in RSS_FEEDS:
             await process_rss_feed(feed_config, processed_urls, limit=rss_limit)
         logger.info("All RSS feeds processed.")
+
+        # Générer les MP3 groupés pour les fenêtres calendaires fermées
+        await flush_grouped_summaries()
     else:
         logger.info("No RSS feeds configured.")
 

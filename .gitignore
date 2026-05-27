@@ -39,6 +39,7 @@ Thumbs.db
 # Project specific
 *.mp3
 debug_output.txt
+grouped_summaries.json
 
 # Logs
 *.log
