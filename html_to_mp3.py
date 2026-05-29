@@ -24,9 +24,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
-INPUT_DIR = os.path.expanduser("/home/killersky4/Téléchargements/versaudio")
-OUTPUT_DIR = os.path.expanduser("/home/killersky4/Documents/Perso/Podcasts/ArtcleTTS")
-ARCHIVE_DIR = os.path.expanduser("/home/killersky4/Téléchargements/versaudio/Archived")
+INPUT_DIR = os.path.expanduser("~/versaudio")          # Dossier source des fichiers HTML
+OUTPUT_DIR = os.path.expanduser("~/Podcasts/ArtcleTTS")  # Dossier de destination des MP3
+ARCHIVE_DIR = os.path.expanduser("~/versaudio/Archived") # Dossier d'archivage des HTML traités
 VOICE = "fr-FR-VivienneNeural"
 CONCURRENCY_LIMIT = 3  # Safe parallel requests limit to avoid Microsoft ban/throttle
 
@@ -42,7 +42,8 @@ ARCHIVE_DIR = os.environ.get('HTML_TO_MP3_ARCHIVE_DIR', ARCHIVE_DIR)
 PROCESSED_URLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed_urls.json")
 SEEN_FEEDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen_feeds.json")
 RSS_FEEDS = [
-    "https://www.acrimed.org/spip.php?page=backend"
+    # Ajoutez ici vos flux RSS, ex:
+    # "https://example.com/feed.rss",
 ]
 
 # --- HELPER FUNCTIONS ---

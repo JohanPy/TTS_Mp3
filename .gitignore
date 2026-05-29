@@ -21,6 +21,7 @@ wheels/
 *.egg
 
 # Virtual Environment
+.venv/
 venv/
 ENV/
 env/
@@ -39,6 +40,15 @@ Thumbs.db
 # Project specific
 *.mp3
 debug_output.txt
+
+# Runtime data (personal — copy from .example to get started)
+processed_urls.json
+seen_feeds.json
+
+# Local working directories (personal)
+input/
+output/
+archived/
 
 # Logs
 *.log
