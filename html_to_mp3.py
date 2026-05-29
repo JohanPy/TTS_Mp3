@@ -30,6 +30,14 @@ ARCHIVE_DIR = os.path.expanduser("/home/killersky4/Téléchargements/versaudio/A
 VOICE = "fr-FR-VivienneNeural"
 CONCURRENCY_LIMIT = 3  # Safe parallel requests limit to avoid Microsoft ban/throttle
 
+# Allow overriding default directories via environment variables. Useful when the
+# script runs under a different user or in CI where the original paths aren't
+# writable. Example overrides:
+#  HTML_TO_MP3_INPUT_DIR, HTML_TO_MP3_OUTPUT_DIR, HTML_TO_MP3_ARCHIVE_DIR
+INPUT_DIR = os.environ.get('HTML_TO_MP3_INPUT_DIR', INPUT_DIR)
+OUTPUT_DIR = os.environ.get('HTML_TO_MP3_OUTPUT_DIR', OUTPUT_DIR)
+ARCHIVE_DIR = os.environ.get('HTML_TO_MP3_ARCHIVE_DIR', ARCHIVE_DIR)
+
 # RSS configuration
 PROCESSED_URLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed_urls.json")
 SEEN_FEEDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen_feeds.json")
