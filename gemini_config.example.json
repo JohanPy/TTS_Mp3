@@ -1,0 +1,6 @@
+{
+    "api_key": "VOTRE_CLE_API_GEMINI",
+    "model": "gemma-4-31b-it",
+    "prompt": "{text}\n\n---\nEn tant qu'ingénieur en informatique, écris en une seule fois le résumé de cet article en français, en 4 à 6 phrases. Texte brut uniquement, sans Markdown, sans tirets, sans introduction. Commence directement par le contenu.",
+    "max_requests_per_minute": 15
+}

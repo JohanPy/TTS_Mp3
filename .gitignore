@@ -41,11 +41,16 @@ Thumbs.db
 *.mp3
 debug_output.txt
 
-# Runtime data (personal — copy from .example to get started)
+# Fichiers de configuration locaux (contiennent des secrets ou des chemins personnels)
+config.json
+gemini_config.json
+
+# Fichiers d'état (générés à l'exécution, propres à chaque machine)
 processed_urls.json
 seen_feeds.json
+grouped_summaries.json
 
-# Local working directories (personal)
+# Dossiers de travail locaux
 input/
 output/
 archived/
