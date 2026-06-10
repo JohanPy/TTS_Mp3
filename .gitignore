@@ -50,13 +50,19 @@ processed_urls.json
 seen_feeds.json
 grouped_summaries.json
 
+<<<<<<< HEAD
+=======
 # Dossiers de travail locaux
 input/
 output/
 archived/
 
+>>>>>>> 6ba7cca8a559b88a6562d10bb603fd2db4ed34f1
 # Logs
 *.log
 
 #Article-Test
 Article-Test/
+
+# backup
+*.bak
