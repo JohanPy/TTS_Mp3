@@ -14,8 +14,8 @@ from bs4 import BeautifulSoup, Tag, NavigableString
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, COMM, USLT, TDRC, APIC
 import urllib.request
 import urllib.error
-from summarizer import get_summarizer
-
+from summarizer import get_summarizer, SummarizationError
+from text_utils import process_inclusive_writing, convertir_chiffres_romains, clean_text_for_tts, strip_markdown_for_tts
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -58,6 +58,46 @@ RSS_FEEDS = _cfg.get("rss_feeds", [])
 PROCESSED_URLS_FILE = os.path.join(_BASE_DIR, "processed_urls.json")
 SEEN_FEEDS_FILE = os.path.join(_BASE_DIR, "seen_feeds.json")
 GROUPED_SUMMARIES_FILE = os.path.join(_BASE_DIR, "grouped_summaries.json")
+
+
+def get_output_dir_for_source(source_type: str) -> str:
+    """
+    Retourne le dossier de sortie configuré pour une source ('html', 'rss', ou 'summary').
+    Accepte aussi les alias comme 'resume', 'resumes'.
+    Si un chemin relatif est fourni, il est résolu par rapport à OUTPUT_DIR.
+    Si aucun dossier spécifique n'est configuré, retourne OUTPUT_DIR par défaut.
+    """
+    possible_keys = [source_type]
+    if source_type in ("summary", "resume", "resumes"):
+        possible_keys = ["summary", "resume", "resumes"]
+    elif source_type in ("html", "htm"):
+        possible_keys = ["html", "htm"]
+    elif source_type in ("rss", "feed", "feeds"):
+        possible_keys = ["rss", "feed", "feeds"]
+
+    specific = None
+    for k in possible_keys:
+        val = _cfg.get(f"output_dir_{k}")
+        if val:
+            specific = val
+            break
+
+    if not specific:
+        output_dirs = _cfg.get("output_dirs")
+        if isinstance(output_dirs, dict):
+            for k in possible_keys:
+                if k in output_dirs:
+                    specific = output_dirs[k]
+                    break
+
+    if not specific:
+        return OUTPUT_DIR
+
+    expanded = os.path.expanduser(specific)
+    if os.path.isabs(expanded):
+        return expanded
+    return os.path.join(OUTPUT_DIR, expanded)
+
 
 # --- HELPER FUNCTIONS ---
 
@@ -117,323 +157,6 @@ def download_image(url):
         logger.warning(f"Failed to download image {url}: {e}")
         return None
 
-# --- INCLUSIVE WRITING HANDLER ---
-
-# Homophones: mots qui s'écrivent différemment au masculin/féminin mais sonnent pareil
-# Le masculin suffit à l'oral
-HOMOPHONES_RACINES = {
-    # Terminaisons en -é (ami/amie, salarié/salariée)
-    "ami", "amie", "salari", "déput", "charg", "employ", "invit", "concern",
-    "abonn", "engag", "fatigu", "motiv", "détermin", "passionn", "diplôm",
-    "qualifi", "expériment", "intéress", "touch", "affect", "impliqu",
-    "préoccup", "inform", "consult", "réuni", "assembl", "group", "rassembl",
-    "marqu", "salu", "accompagn", "guid", "orient", "form", "sensibilis",
-    "mobilis", "organis", "structur", "coordonn", "délég", "mandaté",
-    "autoris", "habilit", "certifi", "agré", "reconnu", "validé",
-    # Autres terminaisons muettes
-    "auteur", "lecteur", "acteur", "directeur", "professeur"
-}
-
-def _sonnent_pareil(masculin: str, feminin: str) -> bool:
-    """
-    Détermine si le masculin et le féminin sonnent pareil à l'oral.
-    Utilise des règles phonétiques françaises + liste d'exceptions.
-    """
-    # Normaliser
-    masc = masculin.lower().strip()
-    fem = feminin.lower().strip()
-    
-    # Identiques
-    if masc == fem:
-        return True
-    
-    # Retirer le 's' final pour comparer les racines
-    masc_base = masc.rstrip('s')
-    fem_base = fem.rstrip('s')
-    
-    # Vérifier dans les homophones connus
-    for racine in HOMOPHONES_RACINES:
-        if masc_base.endswith(racine) or masc_base == racine:
-            return True
-    
-    # Règle: si le féminin = masculin + "e" ou "es"
-    # et que le masculin finit par une voyelle accentuée, ils sonnent pareil
-    if fem_base.startswith(masc_base):
-        suffixe = fem_base[len(masc_base):]
-        if suffixe in ['e', 'es', '']:
-            # Dernière lettre du masculin (sans 's')
-            if masc_base and masc_base[-1] in 'éèêëiîïuûüoôaàâ':
-                return True
-    
-    # Règle: terminaisons en -eur/-euse, -teur/-trice -> différent
-    if masc.endswith('eur') and fem.endswith('euse'):
-        return False
-    if masc.endswith('teur') and fem.endswith('trice'):
-        return False
-    
-    # Règle: terminaisons en -if/-ive -> différent
-    if masc.endswith('if') and fem.endswith('ive'):
-        return False
-    
-    # Règle: terminaisons en -eux/-euse -> différent
-    if masc.endswith('eux') and fem.endswith('euse'):
-        return False
-    
-    # Par défaut: différent (on dédouble)
-    return False
-
-
-def _generer_forme_parlee(masculin: str, feminin: str) -> str:
-    """
-    Génère la forme parlée d'un mot en écriture inclusive.
-    Retourne soit le masculin seul (si homophone), soit "féminin et masculin".
-    """
-    if _sonnent_pareil(masculin, feminin):
-        return masculin
-    else:
-        # Ordre: féminin d'abord (convention courante à l'oral)
-        return f"{feminin} et {masculin}"
-
-
-def process_inclusive_writing(text: str) -> str:
-    """
-    Convertit l'écriture inclusive en forme parlée pour TTS.
-    
-    Gère les patterns:
-    - client·e·s → "clientes et clients" ou "clients" si homophone
-    - client·es → "clientes et clients"
-    - chacun·e → "chacune et chacun"
-    - celleux → "celles et ceux"
-    - iel/iels → "elle ou il" / "elles ou ils"
-    
-    Nettoie aussi les points médians orphelins.
-    """
-    result = text
-    
-    # 1. Remplacer les néologismes inclusifs courants
-    neologismes = {
-        r'\bcelleux\b': 'celles et ceux',
-        r'\bceuxlles\b': 'ceux et celles',
-        r'\biels\b': 'elles et ils',
-        r'\biel\b': 'elle ou il',
-        r'\bae\b': 'a ou e',  # rare mais existe
-    }
-    for pattern, replacement in neologismes.items():
-        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
-    
-    # 2. Pattern complet: mot·e·s ou mot·es·s (pluriel avec double suffixe)
-    # Ex: "client·e·s", "citoyen·ne·s", "lecteur·rice·s"
-    def replace_full_pattern(match):
-        base = match.group(1)      # "client"
-        suffix1 = match.group(2)   # "e" ou "ne" ou "rice"
-        suffix2 = match.group(3)   # "s" (optionnel)
-        
-        # Construire masculin et féminin
-        if suffix2:
-            masculin = base + suffix2  # "clients"
-            feminin = base + suffix1 + suffix2  # "clientes"
-        else:
-            masculin = base  # "client"
-            feminin = base + suffix1  # "cliente"
-        
-        return _generer_forme_parlee(masculin, feminin)
-    
-    # Pattern: mot·suffixe·s ou mot·suffixe (avec point médian ou tiret ou parenthèses)
-    # Séparateurs: · (point médian), - (tiret), . (point), ( )
-    separateurs = r'[·\-\.\(\)]'
-    
-    # Pattern pluriel: base·suffix·s
-    pattern_pluriel = rf'(\w+){separateurs}(\w+){separateurs}([s])\b'
-    result = re.sub(pattern_pluriel, replace_full_pattern, result)
-    
-    # Pattern singulier/court: base·suffix (ex: "chacun·e", "client·es")
-    def replace_short_pattern(match):
-        base = match.group(1)
-        suffix = match.group(2)
-        
-        # Détecter si c'est un pluriel court (suffix = "es" ou "s")
-        if suffix.endswith('s'):
-            masculin = base + 's'
-            feminin = base + suffix
-        else:
-            masculin = base
-            feminin = base + suffix
-        
-        return _generer_forme_parlee(masculin, feminin)
-    
-    pattern_court = rf'(\w+){separateurs}([eé]s?|ne|rice|euse|ive|se)\b'
-    result = re.sub(pattern_court, replace_short_pattern, result, flags=re.IGNORECASE)
-    
-    # 3. Nettoyer les points médians orphelins
-    result = re.sub(r'·', ' ', result)
-    
-    # 4. Nettoyer les espaces multiples
-    result = re.sub(r'\s+', ' ', result)
-    
-    return result
-
-
-def convertir_chiffres_romains(texte):
-    """
-    Convertit les chiffres romains (I, V, X) en chiffres arabes dans des contextes spécifiques
-    (siècles, arrondissements, noms de souverains) pour faciliter la lecture par le TTS.
-    """
-    # Dictionnaire de base pour la conversion (limité aux I, V, X pour limiter les faux positifs)
-    def roman_to_int(s):
-        rom_val = {'I': 1, 'V': 5, 'X': 10}
-        int_val = 0
-        s = s.upper()
-        for i in range(len(s)):
-            # Ignore les caractères non romains qui auraient pu se glisser
-            if s[i] not in rom_val:
-                continue
-
-            if i > 0 and rom_val[s[i]] > rom_val[s[i - 1]]:
-                int_val += rom_val[s[i]] - 2 * rom_val[s[i - 1]]
-            else:
-                int_val += rom_val[s[i]]
-        return int_val
-
-    # 1. Règle pour les Siècles (ex: XIXe siècle, XXème siècle)
-    def replace_siecle(match):
-        roman = match.group(1)
-        mot_siecle = match.group(3)
-        val = roman_to_int(roman)
-
-        # Gestion du "premier"
-        if val == 1:
-            return f"1er {mot_siecle}"
-        return f"{val}ème {mot_siecle}"
-
-    texte = re.sub(r'\b([IVX]+)(e|ème|eme|er)?\s+(siècle|siecles|siècles)\b',
-                   replace_siecle, texte, flags=re.IGNORECASE)
-
-    # 2. Règle pour les Arrondissements (ex: XVe arrondissement, Paris XX)
-    def replace_arrond(match):
-        roman = match.group(1)
-        mot_arrond = match.group(3)
-        val = roman_to_int(roman)
-
-        if val == 1:
-            return f"1er {mot_arrond}"
-        return f"{val}ème {mot_arrond}"
-
-    texte = re.sub(r'\b([IVX]+)(e|ème|eme|er)?\s+(arrondissement|arrondissements)\b',
-                   replace_arrond, texte, flags=re.IGNORECASE)
-
-    # Cas spécifique "Paris XV" ou "Lyon III"
-    def replace_ville_arrond(match):
-        ville = match.group(1)
-        roman = match.group(2)
-        val = roman_to_int(roman)
-        return f"{ville} {val}"
-
-    texte = re.sub(r'\b(Paris|Lyon|Marseille)\s+([IVX]+)(e|ème)?\b',
-                   replace_ville_arrond, texte)
-
-    # 3. Règle pour les Rois / Papes (ex: Louis XIV, Jean-Paul II)
-    def replace_souverain(match):
-        nom = match.group(1)
-        roman = match.group(2)
-        val = roman_to_int(roman)
-
-        if val == 1:
-            return f"{nom} 1er"
-        return f"{nom} {val}"
-
-    # Liste fermée de noms courants pour éviter tout faux positif
-    noms_rois = r"(Louis|Charles|Henri|Jean|Philippe|François|Guillaume|Benoît|Paul|Pie|Jean-Paul|Napoléon|Léopold)"
-    texte = re.sub(r'\b' + noms_rois + r'\s+([IVX]+)(er|e)?\b',
-                   replace_souverain, texte)
-
-    return texte
-
-
-def clean_text_for_tts(text: str) -> str:
-    """
-    Nettoie le texte pour la synthèse vocale en supprimant:
-    - URLs
-    - Numéros de notes de bas de page [1], [2], etc.
-    - Références bibliographiques
-    - DOI et identifiants
-    - Mentions de licence
-    - Métadonnées résiduelles
-    """
-    result = text
-    
-    # 1. Supprimer les URLs (http://, https://, www.)
-    result = re.sub(r'https?://[^\s\)]+', '', result)
-    result = re.sub(r'www\.[^\s\)]+', '', result)
-    
-    # 2. Supprimer les DOI
-    result = re.sub(r'doi\.org/[^\s\)]+', '', result)
-    result = re.sub(r'https?://doi\.org/[^\s]+', '', result)
-    result = re.sub(r'\bdoi\s*:\s*[^\s]+', '', result, flags=re.IGNORECASE)
-    
-    # 3. Supprimer les numéros de notes entre crochets [1], [2], etc.
-    result = re.sub(r'\[\d+\]', '', result)
-    
-    # 4. Supprimer les appels de notes (numéros seuls en exposant ou après un mot)
-    # Pattern original trop agressif: "texte1" ou "texte 1" en fin de phrase avant ponctuation
-    # On limite aux chiffres collés directement à un mot (sans espace) avant une ponctuation forte
-    # Ex: "mot1." ou "mot12," mais pas "le 20 janvier"
-    result = re.sub(r'(?<=[a-zA-Zà-ÿ])\d{1,2}(?=[\.,;:!?])', '', result)
-    # 5. Supprimer les références bibliographiques typiques
-    # Pattern: "Auteur, A. (YYYY). Titre..."
-    result = re.sub(r'\b[A-Z][a-zà-ÿ]+,\s*[A-Z]\.\s*(?:&\s*[A-Z][a-zà-ÿ]+,\s*[A-Z]\.\s*)*\(\d{4}\)\.\s*[^\.]+\.[^\.]*(?:Presses|Éditions|University|Press|Gallimard|Seuil)[^\.]*\.', '', result)
-    
-    # 6. Supprimer les mentions de licence Creative Commons
-    result = re.sub(r'(CC\s+BY[-\w]*|Creative\s+Commons|Tous\s+droits\s+réservés)[^\.]*\.?', '', result, flags=re.IGNORECASE)
-    result = re.sub(r'Le texte seul est utilisable sous licence[^\.]+\.', '', result, flags=re.IGNORECASE)
-    
-    # 7. Supprimer les références électroniques
-    result = re.sub(r'Référence électronique[^\.]*\.?', '', result, flags=re.IGNORECASE)
-    result = re.sub(r'\[En ligne\][^,]*,', '', result, flags=re.IGNORECASE)
-    result = re.sub(r'mis en ligne le[^,\.]+[,\.]', '', result, flags=re.IGNORECASE)
-    result = re.sub(r'consulté le \d+[^\.]+\.', '', result, flags=re.IGNORECASE)
-    result = re.sub(r'URL\s*:', '', result, flags=re.IGNORECASE)
-    
-    # 8. Supprimer les mentions "Paru dans..." "Articles du même auteur"
-    result = re.sub(r'Paru dans[^\.]+\.', '', result, flags=re.IGNORECASE)
-    result = re.sub(r'Articles? du même auteur\.?', '', result, flags=re.IGNORECASE)
-
-    # 9. Supprimer les sections interactives et boilerplate des sites d'actu
-    #    (développez.com, presse générale…)
-    # Couper au premier marqueur de section parasite
-    noise_cutoff_patterns = [
-        r'"Et vous\s*\?"',          # developpez.com forum
-        r'"Et vous aussi"',
-        r'"Voir aussi"',            # liens connexes
-        r'Voir aussi\s*:',
-        r'Vous avez lu gratuitement',  # paywall/abonnement
-        r'Soutenez le club',
-        r'en souscrivant un abonnement',
-        r'Donnez votre avis',
-        r'Réagissez à cet article',
-        r'Laisser un commentaire',
-    ]
-    for pattern in noise_cutoff_patterns:
-        m = re.search(pattern, result, flags=re.IGNORECASE)
-        if m:
-            result = result[:m.start()]
-    
-    # 9. Supprimer les notes numérotées en début de phrase
-    # Pattern: "1 Texte de la note..." "2 Autre note..."
-    # On supprime les lignes qui commencent par un numéro suivi d'un espace et peu de contexte
-    result = re.sub(r'\.\s+\d{1,2}\s+[A-Z][^\.]{10,150}(?:\.\.\.|\.\s)', '. ', result)
-    
-    # 10. Nettoyer les doubles espaces et ponctuation orpheline
-    result = re.sub(r'\s+', ' ', result)
-    result = re.sub(r'\s+([.,;:!?])', r'\1', result)
-    result = re.sub(r'([.,;:!?])\s*\1+', r'\1', result)  # Ponctuation doublée
-    result = re.sub(r'\(\s*\)', '', result)  # Parenthèses vides
-    result = re.sub(r'\[\s*\]', '', result)  # Crochets vides
-    
-    # 11. Nettoyer les espaces avant ponctuation
-    result = re.sub(r'\s+\.', '.', result)
-    result = re.sub(r'\s+,', ',', result)
-    
-    return result.strip()
 
 
 # Old extract_metadata and generate_text_content Removed
@@ -780,7 +503,9 @@ async def flush_grouped_summaries() -> None:
         safe_media = clean_filename(media)
         mp3_name = f"Resumes_{safe_media}_{date_bucket}.mp3"
         mp3_name = limit_filename(mp3_name, 120)
-        mp3_path = os.path.join(OUTPUT_DIR, mp3_name)
+        target_dir = get_output_dir_for_source("summary")
+        os.makedirs(target_dir, exist_ok=True)
+        mp3_path = os.path.join(target_dir, mp3_name)
 
         logger.info(
             f"Génération du MP3 groupé : {mp3_name} ({len(entries)} article(s))"
@@ -943,8 +668,6 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
             # Limit length to 120 characters to avoid sync issues (e.g. with Nextcloud)
             mp3_name = limit_filename(mp3_name, 120)
                 
-            mp3_path = os.path.join(OUTPUT_DIR, mp3_name)
-            
             # Generate body content
             text_body = adapter.get_content()
             if len(text_body) < 50:
@@ -957,7 +680,14 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
             if should_summarize:
                 logger.info(f"Résumé IA activé pour '{title[:60]}' ({len(text_body)} chars)")
                 summarizer = get_summarizer()
-                text_body = await summarizer.summarize(text_body)
+                try:
+                    text_body = await summarizer.summarize(text_body)
+                except SummarizationError as e:
+                    logger.error(
+                        f"Échec du résumé IA pour l'article '{title}': {e}. "
+                        "L'article est mis de côté pour être retenté ultérieurement."
+                    )
+                    continue
 
                 if group_window_hours:
                     # Accumuler dans grouped_summaries.json, pas de MP3 individuel
@@ -978,6 +708,12 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
                     continue
                 # else : text_body est maintenant le résumé → génération MP3 individuelle normale
             # --- FIN RÉSUMÉ IA ---
+
+            # Determine output directory by source type (summary vs rss)
+            source_type = "summary" if should_summarize else "rss"
+            target_dir = get_output_dir_for_source(source_type)
+            os.makedirs(target_dir, exist_ok=True)
+            mp3_path = os.path.join(target_dir, mp3_name)
 
             # Generate MP3 and save tags
             success = await generate_audio_from_content(meta, text_body, mp3_path, feed_voice)
@@ -1031,7 +767,9 @@ async def process_html_file(filepath):
         # Limit length to 120 characters to avoid sync issues (e.g. with Nextcloud)
         mp3_name = limit_filename(mp3_name, 120)
 
-        mp3_path = os.path.join(OUTPUT_DIR, mp3_name)
+        target_dir = get_output_dir_for_source("html")
+        os.makedirs(target_dir, exist_ok=True)
+        mp3_path = os.path.join(target_dir, mp3_name)
 
         # Generate content
         text_body = adapter.get_content()
@@ -1114,7 +852,15 @@ def main_test(test_dir):
 
 async def main(rss_limit=None):
     # Ensure directories exist
-    for directory in [INPUT_DIR, OUTPUT_DIR, ARCHIVE_DIR]:
+    dirs_to_create = {
+        INPUT_DIR,
+        OUTPUT_DIR,
+        ARCHIVE_DIR,
+        get_output_dir_for_source("html"),
+        get_output_dir_for_source("rss"),
+        get_output_dir_for_source("summary"),
+    }
+    for directory in dirs_to_create:
         if not os.path.exists(directory):
             try:
                 os.makedirs(directory, exist_ok=True)

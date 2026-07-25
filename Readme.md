@@ -49,14 +49,23 @@ pip install -r requirements.txt
 
 ### Chemins et paramètres globaux
 
-Les chemins et options sont définis en haut de `html_to_mp3.py` :
+Les chemins et options sont définis dans `config.json` :
 
-```python
-INPUT_DIR  = "~/Téléchargements/versaudio"           # Dossier surveillé (fichiers HTML)
-OUTPUT_DIR = "~/Documents/Perso/Podcasts/ArtcleTTS"  # Dossier de sortie MP3
-ARCHIVE_DIR= "~/Téléchargements/versaudio/Archived"  # Dossier d'archivage après traitement
-VOICE      = "fr-FR-VivienneNeural"                  # Voix globale par défaut
+```json
+{
+    "input_dir": "~/Téléchargements/versaudio",
+    "output_dir": "~/Documents/Perso/Podcasts/ArtcleTTS",
+    "output_dirs": {
+        "html": "HTML",
+        "rss": "RSS",
+        "summary": "Resumes"
+    },
+    "archive_dir": "~/Téléchargements/versaudio/Archived",
+    "voice": "fr-FR-VivienneNeural"
+}
 ```
+
+> **Note sur `output_dirs`** : Permet d'organiser les fichiers audio MP3 par source (`html`, `rss`, `summary` ou `resume`). Si un sous-dossier relatif est indiqué (ex: `"HTML"`), il sera créé automatiquement dans le `output_dir` principal. Vous pouvez également spécifier des chemins absolus (ex: `"~/Podcasts/Resumes"`). Si ce bloc n'est pas renseigné, tous les MP3 sont générés à la racine de `output_dir`.
 
 ### Configuration des flux RSS
 
@@ -111,7 +120,7 @@ Le résumé IA est piloté par le fichier `gemini_config.json` à la racine du p
 | `max_requests_per_minute` | Limite de requêtes (max 15 pour le plan gratuit) |
 | `prompt` | Template du prompt — `{text}` est remplacé par le texte de l'article |
 
-**Comportement en cas d'erreur API** : le résumé est réessayé jusqu'à 5 fois avec un backoff exponentiel (5 s, 10 s, 20 s, 40 s). En cas d'échec définitif, le texte original est utilisé (fallback silencieux, aucun article perdu).
+**Comportement en cas d'erreur API** : le résumé est réessayé jusqu'à 5 fois avec un backoff (5 s, 10 s, 20 s, 120 s). En cas d'échec définitif, une exception `SummarizationError` est levée : l'article n'est pas marqué comme traité (`processed_urls.json`) et l'article complet n'est jamais conservé en fallback. Il sera retenté lors du prochain passage.
 
 > ⚠️ Ne commitez pas `gemini_config.json` si votre dépôt est public — ajoutez-le à `.gitignore`.
 

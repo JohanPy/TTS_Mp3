@@ -13,6 +13,7 @@ import os
 import time
 
 import requests
+from text_utils import preprocess_for_api, strip_markdown_for_tts
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,8 @@ MAX_TEXT_LENGTH = 8000
 
 # Délai initial entre tentatives en cas d'erreur API transitoire (secondes)
 RETRY_BASE_DELAY = 5.0
+# Délai avant la dernière tentative (secondes, 2 minutes)
+RETRY_LAST_DELAY = 120.0
 # Nombre maximum de tentatives (1 essai initial + N-1 répétitions)
 MAX_RETRIES = 5
 # Codes HTTP transitoires qui méritent un retry
@@ -79,13 +82,18 @@ def load_gemini_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
     return config
 
 
+class SummarizationError(Exception):
+    """Exception levée lorsque la génération du résumé par l'IA échoue."""
+    pass
+
+
 class GeminiSummarizer:
     """
     Résumeur d'articles via l'API REST Gemini/Gemma.
 
     Gère automatiquement le rate limiting : au plus `max_requests_per_minute`
     appels par minute. Si la limite est atteinte, attend le délai nécessaire.
-    En cas d'erreur API, retourne le texte original (fallback silencieux).
+    En cas d'erreur API, lève une SummarizationError (l'article est retenté plus tard).
     """
 
     def __init__(self, config_path: str = DEFAULT_CONFIG_PATH):
@@ -159,94 +167,12 @@ class GeminiSummarizer:
 
         return text
 
-    def _strip_markdown_for_tts(self, text: str) -> str:
-        """
-        Supprime les éléments Markdown du texte pour que le TTS le lise correctement.
-        - **gras** → gras
-        - *italique* → italique
-        - `code` → code
-        - # Titre → Titre
-        - * puce → texte de la puce (avec virgule pour liaison)
-        """
-        import re
-        t = text
-        # Gras **text** ou __text__
-        t = re.sub(r'\*{2}(.+?)\*{2}', r'\1', t)
-        t = re.sub(r'_{2}(.+?)_{2}', r'\1', t)
-        # Italique *text* ou _text_ (après avoir traité le gras)
-        t = re.sub(r'\*(.+?)\*', r'\1', t)
-        t = re.sub(r'_(.+?)_', r'\1', t)
-        # Code inline `text`
-        t = re.sub(r'`(.+?)`', r'\1', t)
-        # Titres # / ## / ###
-        t = re.sub(r'^#{1,6}\s+', '', t, flags=re.MULTILINE)
-        # Puces : lignes commençant par * ou - ou +
-        t = re.sub(r'^\s*[\*\-\+]\s+', '', t, flags=re.MULTILINE)
-        # Puces numérotées : 1. item
-        t = re.sub(r'^\s*\d+\.\s+', '', t, flags=re.MULTILINE)
-        # Normaliser les espaces et les sauts de ligne
-        t = re.sub(r'\n{2,}', ' ', t)
-        t = re.sub(r'\s+', ' ', t).strip()
-        return t
 
-    def _preprocess_for_api(self, text: str) -> str:
-        """
-        Nettoie le texte avant envoi à l'API pour améliorer la qualité du résumé.
-
-        Supprime :
-        - Les separateurs TTS ``.. `` (remplacés par un espace)
-        - Les blocs de titre/description en début (lignes entre guillemets)
-        - Les sections de forum/boilerplate (« Et vous ? », « Voir aussi »,
-          abonnements, publicité, commentaires)
-        - Les lignes trop courtes (artefacts de formatage)
-        """
-        import re
-        t = text
-
-        # 1. Supprimer les guillemets typographiques de section ("Titre..." .. "Sous-titre...") 
-        #    qui dupliquent le titre et le résumé déjà connus
-        t = re.sub(r'^(?:\s*"[^"]{0,300}"\s*\.{0,3}\s*)+', '', t, flags=re.DOTALL)
-
-        # 2. Couper au premier marqueur de section-parasites
-        noise_markers = [
-            r'"Et vous\s*\?"',
-            r'"Voir aussi"',
-            r'"Et vous aussi"',
-            r'Vous avez lu gratuitement',
-            r'Soutenez le club',
-            r'en souscrivant un abonnement',
-            r'Donnez votre avis',
-        ]
-        for marker in noise_markers:
-            m = re.search(marker, t, flags=re.IGNORECASE)
-            if m:
-                t = t[:m.start()]
-
-        # 3. Remplacer les séparateurs TTS « .. » par un espace propre
-        t = re.sub(r'\s*\.\.\s*', ' ', t)
-
-        # 4. Supprimer les lignes trop courtes (< 20 chars) qui sont des artefacts
-        lines = [l.strip() for l in t.splitlines()]
-        lines = [l for l in lines if len(l) >= 20 or l == '']
-        t = ' '.join(lines)
-
-        # 5. Normaliser les espaces
-        t = re.sub(r'\s+', ' ', t).strip()
-
-        if len(t) < 100:
-            logger.debug("Pré-traitement API : texte trop court après nettoyage, utilisation du texte original")
-            return text
-
-        logger.debug(
-            f"Pré-traitement API : {len(text)} → {len(t)} chars "
-            f"({100 * len(t) // len(text)}% conservé)"
-        )
-        return t
 
     def _build_prompt(self, text: str) -> str:
         """Construit le prompt complet en substituant {text} dans le template."""
         # Pré-nettoyer avant troncature pour maximiser l'information utile
-        cleaned = self._preprocess_for_api(text)
+        cleaned = preprocess_for_api(text)
         truncated = cleaned[:MAX_TEXT_LENGTH]
         if len(cleaned) > MAX_TEXT_LENGTH:
             logger.debug(
@@ -285,7 +211,7 @@ class GeminiSummarizer:
             except Exception as e:
                 last_exc = e
                 if attempt < MAX_RETRIES:
-                    wait = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    wait = RETRY_LAST_DELAY if attempt == MAX_RETRIES - 1 else RETRY_BASE_DELAY * (2 ** (attempt - 1))
                     logger.warning(
                         f"Gemini API tentative {attempt}/{MAX_RETRIES} — erreur réseau ({e}). "
                         f"Nouvelle tentative dans {wait:.0f}s…"
@@ -297,7 +223,7 @@ class GeminiSummarizer:
                 break
 
             if response.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
-                wait = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                wait = RETRY_LAST_DELAY if attempt == MAX_RETRIES - 1 else RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 logger.warning(
                     f"Gemini API tentative {attempt}/{MAX_RETRIES} — HTTP {response.status_code}. "
                     f"Nouvelle tentative dans {wait:.0f}s…"
@@ -344,14 +270,17 @@ class GeminiSummarizer:
         """
         Résume le texte fourni via l'API Gemini.
 
-        En cas d'erreur (réseau, API, quota), retourne le texte original
-        pour ne pas bloquer la génération audio (fallback silencieux).
+        En cas d'erreur (réseau, API, quota), lève une SummarizationError
+        afin de pouvoir retenter plus tard sans conserver l'article complet.
 
         Args:
             text: Texte brut de l'article à résumer.
 
         Returns:
-            Texte résumé, ou texte original si l'API est indisponible.
+            Texte résumé.
+
+        Raises:
+            SummarizationError: Si la génération du résumé échoue.
         """
         if not text or len(text.strip()) < 50:
             return text
@@ -365,19 +294,18 @@ class GeminiSummarizer:
             summary = await loop.run_in_executor(None, self._call_api_sync, prompt)
             # Extraire le résumé final depuis la sortie potentiellement verbose
             summary = self._extract_core_response(summary)
-            # Nettoyer le Markdown résiduel pour que le TTS lise correctement
-            summary = self._strip_markdown_for_tts(summary)
+            # 3. Supprimer le Markdown pour ne pas polluer le TTS
+            summary = strip_markdown_for_tts(summary)
             logger.info(
                 f"Résumé généré : {len(text)} chars → {len(summary)} chars "
                 f"({100 * len(summary) // len(text)}% du texte original)"
             )
             return summary
         except Exception as e:
-            logger.warning(
-                f"Échec de la résumé Gemini ({e.__class__.__name__}: {e}). "
-                "Utilisation du texte original."
+            logger.error(
+                f"Échec du résumé Gemini ({e.__class__.__name__}: {e})."
             )
-            return text
+            raise SummarizationError(f"Échec du résumé Gemini : {e}") from e
 
 
 def get_summarizer(config_path: str = DEFAULT_CONFIG_PATH) -> GeminiSummarizer:

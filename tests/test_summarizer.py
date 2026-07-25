@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import summarizer as summarizer_module
 from summarizer import (
     GeminiSummarizer,
+    SummarizationError,
     get_summarizer,
     load_gemini_config,
     reset_summarizer,
@@ -244,8 +245,8 @@ class TestSummarizeSuccess(unittest.TestCase):
         self.assertNotIn("A" * (summarizer_module.MAX_TEXT_LENGTH + 1), sent_text)
 
 
-class TestSummarizeFallback(unittest.TestCase):
-    """Tests du fallback silencieux en cas d'erreur API."""
+class TestSummarizeErrorHandling(unittest.TestCase):
+    """Tests de la levée d'exception en cas d'erreur API (pas de fallback texte complet)."""
 
     def setUp(self):
         reset_summarizer()
@@ -258,27 +259,26 @@ class TestSummarizeFallback(unittest.TestCase):
         os.unlink(self._config_path)
         reset_summarizer()
 
-    def test_api_error_returns_original_text(self):
-        """En cas d'erreur HTTP, retourne le texte original."""
+    def test_api_error_raises_exception(self):
+        """En cas d'erreur HTTP, lève SummarizationError."""
         mock_resp = MagicMock()
         mock_resp.status_code = 400
         mock_resp.text = "Bad Request"
 
-        article = "Texte original de l'article."
+        article = "Texte original de l'article avec suffisamment de texte pour dépasser les 50 caractères requis."
         with patch("requests.post", return_value=mock_resp):
-            result = _run(self._summarizer.summarize(article))
+            with self.assertRaises(SummarizationError):
+                _run(self._summarizer.summarize(article))
 
-        self.assertEqual(result, article)
-
-    def test_network_error_returns_original_text(self):
-        """En cas d'erreur réseau, retourne le texte original."""
+    def test_network_error_raises_exception(self):
+        """En cas d'erreur réseau, lève SummarizationError."""
         import requests as req_module
 
-        article = "Texte original de l'article."
-        with patch("requests.post", side_effect=req_module.ConnectionError("Network down")):
-            result = _run(self._summarizer.summarize(article))
-
-        self.assertEqual(result, article)
+        article = "Texte original de l'article avec suffisamment de texte pour dépasser les 50 caractères requis."
+        with patch("requests.post", side_effect=req_module.ConnectionError("Network down")), \
+             patch("time.sleep"):
+            with self.assertRaises(SummarizationError):
+                _run(self._summarizer.summarize(article))
 
     def test_short_text_returned_as_is(self):
         """Un texte trop court (< 50 chars) est retourné sans appel API."""
@@ -288,17 +288,33 @@ class TestSummarizeFallback(unittest.TestCase):
         mock_post.assert_not_called()
         self.assertEqual(result, short)
 
-    def test_empty_candidates_returns_original(self):
-        """Si l'API renvoie des candidates vides, retourne le texte original."""
+    def test_empty_candidates_raises_exception(self):
+        """Si l'API renvoie des candidates vides, lève SummarizationError."""
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {"candidates": []}
 
         article = "Texte original de l'article assez long pour être traité correctement."
         with patch("requests.post", return_value=mock_resp):
-            result = _run(self._summarizer.summarize(article))
+            with self.assertRaises(SummarizationError):
+                _run(self._summarizer.summarize(article))
 
-        self.assertEqual(result, article)
+    def test_retry_delays_include_last_delay_2min(self):
+        """Vérifie que les délais de retry sont 5s, 10s, 20s puis 120s pour la dernière tentative."""
+        import requests as req_module
+
+        article = "Texte original de l'article avec suffisamment de texte pour dépasser les 50 caractères requis."
+        sleep_delays = []
+
+        def fake_sleep(duration):
+            sleep_delays.append(duration)
+
+        with patch("requests.post", side_effect=req_module.ConnectionError("Network down")), \
+             patch("time.sleep", side_effect=fake_sleep):
+            with self.assertRaises(SummarizationError):
+                _run(self._summarizer.summarize(article))
+
+        self.assertEqual(sleep_delays, [5.0, 10.0, 20.0, 120.0])
 
 
 class TestSingleton(unittest.TestCase):

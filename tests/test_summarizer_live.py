@@ -95,7 +95,11 @@ async def test_feed(feed_url: str, limit: int):
         print(f"\n{SUBSEP}")
         print("APPEL API GEMINI...")
         print(SUBSEP)
-        summary = await summarizer.summarize(raw_text)
+        try:
+            summary = await summarizer.summarize(raw_text)
+        except Exception as e:
+            print(f"  ❌  ÉCHEC DU RÉSUMÉ IA : {e}")
+            continue
 
         ratio = round(100 * len(summary) / len(raw_text)) if raw_text else 0
         print(f"\nRÉSUMÉ IA ({len(summary)} chars, {ratio}% du texte original) :")
@@ -108,10 +112,6 @@ async def test_feed(feed_url: str, limit: int):
         print(f"  Texte original : {len(raw_text):>6} chars  |  {len(raw_text.split()):>5} mots")
         print(f"  Résumé IA      : {len(summary):>6} chars  |  {len(summary.split()):>5} mots")
         print(f"  Réduction      : {100 - ratio:>5}%")
-
-        # Détecter si c'est un fallback (résumé = texte original)
-        if summary.strip() == raw_text.strip():
-            print("  ⚠  ATTENTION : le résumé est identique au texte original (fallback API)")
 
     print(f"\n{SEPARATOR}")
     print("Test terminé.")

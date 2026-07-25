@@ -1,6 +1,11 @@
 {
     "input_dir": "~/Téléchargements/versaudio",
     "output_dir": "~/Documents/Perso/Podcasts/ArtcleTTS",
+    "output_dirs": {
+        "html": "HTML",
+        "rss": "RSS",
+        "summary": "Resumes"
+    },
     "archive_dir": "~/Téléchargements/versaudio/Archived",
     "voice": "fr-FR-VivienneNeural",
     "concurrency_limit": 3,
