@@ -424,11 +424,16 @@ def store_pending_summary(
     summary: str,
     window_hours: int,
     voice: str,
+    date_bucket: str = None,
 ) -> None:
     """
     Ajoute un résumé dans la liste d'attente grouped_summaries.json.
-    Le date_bucket est la date courante ISO (ex. "2026-05-27").
+    Le date_bucket est la date de publication de l'article, 
+    ou la date courante si non précisée.
     """
+    if not date_bucket:
+        date_bucket = date.today().isoformat()
+        
     data = load_grouped_summaries()
     entry = {
         "feed_url": feed_url,
@@ -436,7 +441,7 @@ def store_pending_summary(
         "title": title,
         "article_url": article_url,
         "summary": summary,
-        "date_bucket": date.today().isoformat(),
+        "date_bucket": date_bucket,
         "window_hours": window_hours,
         "voice": voice,
     }
@@ -699,6 +704,7 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
                         summary=text_body,
                         window_hours=group_window_hours,
                         voice=feed_voice,
+                        date_bucket=meta.get("date"),
                     )
                     save_processed_url(link)
                     processed_urls.add(link)
