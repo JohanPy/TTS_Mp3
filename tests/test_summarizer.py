@@ -92,15 +92,38 @@ class TestLoadConfig(unittest.TestCase):
             os.unlink(path)
 
     def test_load_rpm_too_high(self):
-        """Lève ValueError si max_requests_per_minute > 15."""
-        bad_config = {**VALID_CONFIG, "max_requests_per_minute": 20}
+        """Lève ValueError si max_requests_per_minute > 1800."""
+        bad_config = {**VALID_CONFIG, "max_requests_per_minute": 2000}
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(bad_config, f)
             path = f.name
         try:
             with self.assertRaises(ValueError) as ctx:
                 load_gemini_config(path)
-            self.assertIn("15", str(ctx.exception))
+            self.assertIn("1800", str(ctx.exception))
+        finally:
+            os.unlink(path)
+
+    def test_load_default_concurrency(self):
+        """Si concurrency n'est pas spécifié, la valeur par défaut est 6."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(VALID_CONFIG, f)
+            path = f.name
+        try:
+            config = load_gemini_config(path)
+            self.assertEqual(config["concurrency"], 6)
+        finally:
+            os.unlink(path)
+
+    def test_load_custom_concurrency(self):
+        """Prend en compte une valeur de concurrency valide."""
+        custom_config = {**VALID_CONFIG, "concurrency": 8}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(custom_config, f)
+            path = f.name
+        try:
+            config = load_gemini_config(path)
+            self.assertEqual(config["concurrency"], 8)
         finally:
             os.unlink(path)
 

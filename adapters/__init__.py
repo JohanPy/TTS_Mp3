@@ -41,8 +41,8 @@ def get_adapter(soup, filename):
     for adapter_cls in adapters:
         adapter = adapter_cls(soup, filename)
         if adapter.can_handle():
-            logger.info(f"Using adapter: {adapter_cls.__name__}")
+            logger.debug(f"Using adapter: {adapter_cls.__name__}")
             return adapter
 
-    logger.info("Using adapter: GenericAdapter")
+    logger.debug("Using adapter: GenericAdapter")
     return GenericAdapter(soup, filename)

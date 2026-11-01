@@ -77,10 +77,18 @@ def load_gemini_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
         )
 
     rpm = config["max_requests_per_minute"]
-    if not isinstance(rpm, (int, float)) or rpm <= 0 or rpm > 15:
+    if not isinstance(rpm, (int, float)) or rpm <= 0 or rpm > 1800:
         raise ValueError(
-            f"max_requests_per_minute doit être un nombre entre 1 et 15 (reçu : {rpm})"
+            f"max_requests_per_minute doit être un nombre entre 1 et 1800 (reçu : {rpm})"
         )
+
+    # Concurrence optionnelle pour les résumés simultanés (défaut : 6)
+    raw_concurrency = config.get("concurrency", 6)
+    if not isinstance(raw_concurrency, (int, float)) or raw_concurrency <= 0 or raw_concurrency > 30:
+        raise ValueError(
+            f"concurrency doit être un nombre entre 1 et 30 (reçu : {raw_concurrency})"
+        )
+    config["concurrency"] = int(raw_concurrency)
 
     # Timeout optionnel (secondes, défaut: DEFAULT_TIMEOUT_SECONDS)
     raw_timeout = config.get("timeout") or config.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS
@@ -118,10 +126,13 @@ class GeminiSummarizer:
         self._max_rpm: int = int(self._config["max_requests_per_minute"])
         self._min_interval: float = 60.0 / self._max_rpm
         self._timeout: int = self._config.get("timeout", DEFAULT_TIMEOUT_SECONDS)
+        self._concurrency: int = self._config.get("concurrency", 6)
+        self._semaphore = asyncio.Semaphore(self._concurrency)
 
         logger.info(
             f"GeminiSummarizer initialisé — modèle : {self._model}, "
             f"timeout : {self._timeout}s, "
+            f"concurrence : {self._concurrency}, "
             f"limite : {self._max_rpm} req/min (intervalle min : {self._min_interval:.1f}s)"
         )
 
@@ -193,13 +204,14 @@ class GeminiSummarizer:
             )
         return self._prompt_template.replace("{text}", truncated)
 
-    def _call_api_sync(self, prompt: str) -> str:
+    def _call_api_sync(self, prompt: str, label: str = "") -> str:
         """
         Appel synchrone à l'API REST Gemini avec retry sur erreurs transitoires.
         Retourne le texte résumé ou lève une exception en cas d'échec définitif.
         """
         import time as _time
 
+        tag = f" {label}" if label else ""
         url = GEMINI_API_URL.format(model=self._model)
         params = {"key": self._api_key}
         body = {
@@ -226,7 +238,7 @@ class GeminiSummarizer:
                 if attempt < MAX_RETRIES:
                     wait = RETRY_LAST_DELAY if attempt == MAX_RETRIES - 1 else RETRY_BASE_DELAY * (2 ** (attempt - 1))
                     logger.warning(
-                        f"Gemini API tentative {attempt}/{MAX_RETRIES} — erreur réseau ({e}). "
+                        f"Gemma tentative {attempt}/{MAX_RETRIES}{tag} — erreur réseau ({e}). "
                         f"Nouvelle tentative dans {wait:.0f}s…"
                     )
                     _time.sleep(wait)
@@ -236,7 +248,7 @@ class GeminiSummarizer:
                 if response.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
                     wait = RETRY_LAST_DELAY if attempt == MAX_RETRIES - 1 else RETRY_BASE_DELAY * (2 ** (attempt - 1))
                     logger.warning(
-                        f"Gemini API tentative {attempt}/{MAX_RETRIES} — HTTP {response.status_code}. "
+                        f"Gemma tentative {attempt}/{MAX_RETRIES}{tag} — HTTP {response.status_code}. "
                         f"Nouvelle tentative dans {wait:.0f}s…"
                     )
                     _time.sleep(wait)
@@ -277,7 +289,7 @@ class GeminiSummarizer:
                 if attempt < MAX_RETRIES:
                     wait = RETRY_LAST_DELAY if attempt == MAX_RETRIES - 1 else RETRY_BASE_DELAY * (2 ** (attempt - 1))
                     logger.warning(
-                        f"Gemini API tentative {attempt}/{MAX_RETRIES} — {e} (réponse incomplète ou interruption). "
+                        f"Gemma tentative {attempt}/{MAX_RETRIES}{tag} — {e} (réponse incomplète ou interruption). "
                         f"Nouvelle tentative dans {wait:.0f}s…"
                     )
                     _time.sleep(wait)
@@ -285,7 +297,7 @@ class GeminiSummarizer:
         else:
             raise last_exc
 
-    async def summarize(self, text: str) -> str:
+    async def summarize(self, text: str, label: str = "") -> str:
         """
         Résume le texte fourni via l'API Gemini.
 
@@ -294,6 +306,7 @@ class GeminiSummarizer:
 
         Args:
             text: Texte brut de l'article à résumer.
+            label: Identifiant optionnel pour les logs (ex: '[1/12]').
 
         Returns:
             Texte résumé.
@@ -304,27 +317,37 @@ class GeminiSummarizer:
         if not text or len(text.strip()) < 50:
             return text
 
-        await self._enforce_rate_limit()
+        tag = f" {label}" if label else ""
+        async with self._semaphore:
+            await self._enforce_rate_limit()
 
-        prompt = self._build_prompt(text)
+            prompt = self._build_prompt(text)
+            start_t = time.monotonic()
 
-        try:
-            loop = asyncio.get_event_loop()
-            summary = await loop.run_in_executor(None, self._call_api_sync, prompt)
-            # Extraire le résumé final depuis la sortie potentiellement verbose
-            summary = self._extract_core_response(summary)
-            # 3. Supprimer le Markdown pour ne pas polluer le TTS
-            summary = strip_markdown_for_tts(summary)
-            logger.info(
-                f"Résumé généré : {len(text)} chars → {len(summary)} chars "
-                f"({100 * len(summary) // len(text)}% du texte original)"
-            )
-            return summary
-        except Exception as e:
-            logger.error(
-                f"Échec du résumé Gemini ({e.__class__.__name__}: {e})."
-            )
-            raise SummarizationError(f"Échec du résumé Gemini : {e}") from e
+            try:
+                loop = asyncio.get_event_loop()
+                try:
+                    summary = await loop.run_in_executor(None, lambda: self._call_api_sync(prompt, label=label))
+                except TypeError:
+                    summary = await loop.run_in_executor(None, lambda: self._call_api_sync(prompt))
+
+                # Extraire le résumé final depuis la sortie potentiellement verbose
+                summary = self._extract_core_response(summary)
+                # 3. Supprimer le Markdown pour ne pas polluer le TTS
+                summary = strip_markdown_for_tts(summary)
+                duration = time.monotonic() - start_t
+                ratio = 100 * len(summary) // len(text)
+                reduction = 100 - ratio
+                logger.info(
+                    f"🤖 Résumé IA généré{tag} : {len(text)} → {len(summary)} car. "
+                    f"({ratio}%, -{reduction}%) en {duration:.1f}s"
+                )
+                return summary
+            except Exception as e:
+                logger.error(
+                    f"Échec du résumé Gemini{tag} ({e.__class__.__name__}: {e})."
+                )
+                raise SummarizationError(f"Échec du résumé Gemini : {e}") from e
 
 
 def get_summarizer(config_path: str = DEFAULT_CONFIG_PATH) -> GeminiSummarizer:

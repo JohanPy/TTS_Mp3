@@ -2,6 +2,7 @@
 import os
 import shutil
 import asyncio
+import time
 import edge_tts
 import feedparser
 import logging
@@ -17,13 +18,70 @@ import urllib.error
 from summarizer import get_summarizer, SummarizationError
 from text_utils import process_inclusive_writing, convertir_chiffres_romains, clean_text_for_tts, strip_markdown_for_tts
 
+import sys
+
 # --- LOGGING SETUP ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+class CleanConsoleFormatter(logging.Formatter):
+    """
+    Formateur console épuré et lisible :
+    - Horodatage court : HH:MM:SS
+    - Badges de niveau concis et colorés si stdout est un terminal
+    - Messages alignés pour une lecture fluide
+    """
+    COLORS = {
+        logging.DEBUG: "\033[2m",           # Dim
+        logging.INFO: "\033[36m",            # Cyan
+        logging.WARNING: "\033[33m\033[1m",  # Yellow bold
+        logging.ERROR: "\033[31m\033[1m",    # Red bold
+        logging.CRITICAL: "\033[41m\033[1m", # Red background
+    }
+    RESET = "\033[0m"
+    DIM = "\033[2m"
+
+    def __init__(self, use_color: bool = None):
+        super().__init__(datefmt="%H:%M:%S")
+        if use_color is None:
+            self.use_color = sys.stdout.isatty()
+        else:
+            self.use_color = use_color
+
+    def format(self, record: logging.LogRecord) -> str:
+        time_str = self.formatTime(record, self.datefmt)
+        level_name = record.levelname
+        badges = {
+            logging.DEBUG: "[DEBUG]",
+            logging.INFO: "[INFO] ",
+            logging.WARNING: "[WARN] ",
+            logging.ERROR: "[ERROR]",
+            logging.CRITICAL: "[CRIT] ",
+        }
+        badge = badges.get(record.levelno, f"[{level_name[:5]:<5}]")
+
+        if self.use_color:
+            color = self.COLORS.get(record.levelno, "")
+            formatted_time = f"{self.DIM}{time_str}{self.RESET}"
+            formatted_badge = f"{color}{badge}{self.RESET}"
+        else:
+            formatted_time = time_str
+            formatted_badge = f"{badge}"
+
+        return f"{formatted_time} {formatted_badge} {record.getMessage()}"
+
+
+def setup_clean_logging(level=logging.INFO):
+    """Configure la sortie console avec CleanConsoleFormatter."""
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(CleanConsoleFormatter())
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+    return logging.getLogger(__name__)
+
+
+logger = setup_clean_logging()
 
 # --- CONFIGURATION ---
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,22 +117,80 @@ PROCESSED_URLS_FILE = os.path.join(_BASE_DIR, "processed_urls.json")
 SEEN_FEEDS_FILE = os.path.join(_BASE_DIR, "seen_feeds.json")
 GROUPED_SUMMARIES_FILE = os.path.join(_BASE_DIR, "grouped_summaries.json")
 
+# Verrous asynchrones pour l'accès concurrent aux fichiers d'état
+_processed_urls_lock = asyncio.Lock()
+_grouped_summaries_lock = asyncio.Lock()
+
 # Configuration TTS et retries
 TTS_MAX_RETRIES = 3
 TTS_RETRY_BASE_DELAY = 3.0
+
+
+class EdgeTTSRateLimiter:
+    """
+    Régulateur de débit pour les appels à Edge-TTS :
+    - Limite la fréquence d'appels à max_rpm (défaut 18/min, pour respecter la limite stricte de 20/min).
+    - Limite le nombre de transferts simultanés via un sémaphore (défaut 2).
+    """
+    def __init__(self, max_rpm: int = 18, max_concurrency: int = 2):
+        self._max_rpm = max_rpm
+        self._window_seconds = 60.0
+        self._timestamps: list = []
+        self._lock = asyncio.Lock()
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def acquire(self) -> None:
+        """Attend jusqu'à ce qu'un créneau soit disponible selon le quota et la concurrence."""
+        await self._semaphore.acquire()
+        try:
+            async with self._lock:
+                while True:
+                    now = time.monotonic()
+                    cutoff = now - self._window_seconds
+                    self._timestamps = [t for t in self._timestamps if t > cutoff]
+
+                    if len(self._timestamps) < self._max_rpm:
+                        self._timestamps.append(now)
+                        break
+
+                    sleep_time = self._timestamps[0] + self._window_seconds - now + 0.1
+                    logger.debug(
+                        f"Edge-TTS rate limit atteint ({len(self._timestamps)}/{self._max_rpm} req/min). "
+                        f"Attente de {sleep_time:.2f}s…"
+                    )
+                    await asyncio.sleep(sleep_time)
+        except Exception:
+            self._semaphore.release()
+            raise
+
+    def release(self) -> None:
+        """Libère le sémaphore de concurrence."""
+        self._semaphore.release()
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
+_tts_limiter = EdgeTTSRateLimiter(max_rpm=18, max_concurrency=2)
 
 
 async def generate_tts_file(text: str, voice: str, mp3_path: str, max_retries: int = TTS_MAX_RETRIES) -> None:
     """
     Génère un fichier MP3 via edge-tts avec mécanisme de retry en cas d'erreur transitoire
     (ex: déconnexion websocket, NoAudioReceived, throttling temporaire).
+    Régulé par _tts_limiter pour respecter le quota de 20 req/min et limiter la concurrence.
     Supprime tout fichier incomplet ou vide en cas d'échec.
     """
     last_exc = RuntimeError("Aucune tentative effectuée")
     for attempt in range(1, max_retries + 1):
         try:
-            communicate = edge_tts.Communicate(text, voice)
-            await communicate.save(mp3_path)
+            async with _tts_limiter:
+                communicate = edge_tts.Communicate(text, voice)
+                await communicate.save(mp3_path)
             if os.path.exists(mp3_path) and os.path.getsize(mp3_path) == 0:
                 raise RuntimeError(f"Fichier audio généré vide (0 octet) : {mp3_path}")
             return
@@ -318,6 +434,17 @@ def save_processed_urls(new_urls):
         logger.error(f"Failed to save processed URLs: {e}")
 
 
+async def save_processed_urls_async(new_urls) -> None:
+    """Sauvegarde de façon asynchrone et thread-safe les URLs traitées."""
+    async with _processed_urls_lock:
+        save_processed_urls(new_urls)
+
+
+async def save_processed_url_async(url) -> None:
+    """Sauvegarde de façon asynchrone et thread-safe une URL traitée."""
+    await save_processed_urls_async([url])
+
+
 def load_seen_feeds():
     """Loads the set of already initialized RSS feed URLs."""
     if os.path.exists(SEEN_FEEDS_FILE):
@@ -369,7 +496,7 @@ async def generate_audio_from_content(meta, text_body, mp3_path, voice=VOICE):
         return False
 
     # Generate Audio
-    logger.info(f"Generating MP3: {os.path.basename(mp3_path)}")
+    logger.debug(f"Generating MP3: {os.path.basename(mp3_path)}")
     logger.debug(f"Content Preview: {full_content[:100]}...")
     
     try:
@@ -484,6 +611,30 @@ def store_pending_summary(
     logger.debug(f"Résumé mis en attente de regroupement : {title[:60]}")
 
 
+async def store_pending_summary_async(
+    feed_url: str,
+    media: str,
+    title: str,
+    article_url: str,
+    summary: str,
+    window_hours: int,
+    voice: str,
+    date_bucket: str = None,
+) -> None:
+    """Ajoute un résumé dans grouped_summaries.json de façon sécurisée par verrou asynchrone."""
+    async with _grouped_summaries_lock:
+        store_pending_summary(
+            feed_url=feed_url,
+            media=media,
+            title=title,
+            article_url=article_url,
+            summary=summary,
+            window_hours=window_hours,
+            voice=voice,
+            date_bucket=date_bucket,
+        )
+
+
 def _build_grouped_text(media: str, date_bucket: str, entries: list) -> str:
     """Construit le texte complet du MP3 groupé à partir de la liste de résumés."""
     n = len(entries)
@@ -511,78 +662,80 @@ async def flush_grouped_summaries() -> None:
     (date_bucket strictement antérieure à aujourd'hui).
 
     Les entrées traitées sont retirées de grouped_summaries.json.
+    Sécurisé par _grouped_summaries_lock pour éviter les accès concurrents.
     """
-    data = load_grouped_summaries()
-    pending = data.get("pending", [])
-    if not pending:
-        return
+    async with _grouped_summaries_lock:
+        data = load_grouped_summaries()
+        pending = data.get("pending", [])
+        if not pending:
+            return
 
-    today_str = date.today().isoformat()
+        today_str = date.today().isoformat()
 
-    # Grouper les entrées par (feed_url, date_bucket)
-    groups: dict = {}
-    remaining: list = []
+        # Grouper les entrées par (feed_url, date_bucket)
+        groups: dict = {}
+        remaining: list = []
 
-    for entry in pending:
-        bucket = entry.get("date_bucket", "")
-        if bucket < today_str:
-            key = (entry["feed_url"], bucket)
-            groups.setdefault(key, []).append(entry)
-        else:
-            remaining.append(entry)
+        for entry in pending:
+            bucket = entry.get("date_bucket", "")
+            if bucket < today_str:
+                key = (entry["feed_url"], bucket)
+                groups.setdefault(key, []).append(entry)
+            else:
+                remaining.append(entry)
 
-    if not groups:
-        logger.debug("flush_grouped_summaries : aucune fenêtre fermée à traiter.")
-        return
+        if not groups:
+            logger.debug("flush_grouped_summaries : aucune fenêtre fermée à traiter.")
+            return
 
-    for (feed_url, date_bucket), entries in groups.items():
-        media = entries[0].get("media", "Unknown Media")
-        voice = entries[0].get("voice", VOICE)
+        for (feed_url, date_bucket), entries in groups.items():
+            media = entries[0].get("media", "Unknown Media")
+            voice = entries[0].get("voice", VOICE)
 
-        safe_media = clean_filename(media)
-        mp3_name = f"Resumes_{safe_media}_{date_bucket}.mp3"
-        mp3_name = limit_filename(mp3_name, 120)
-        target_dir = get_output_dir_for_source("summary")
-        os.makedirs(target_dir, exist_ok=True)
-        mp3_path = os.path.join(target_dir, mp3_name)
+            safe_media = clean_filename(media)
+            mp3_name = f"Resumes_{safe_media}_{date_bucket}.mp3"
+            mp3_name = limit_filename(mp3_name, 120)
+            target_dir = get_output_dir_for_source("summary")
+            os.makedirs(target_dir, exist_ok=True)
+            mp3_path = os.path.join(target_dir, mp3_name)
 
-        logger.info(
-            f"Génération du MP3 groupé : {mp3_name} ({len(entries)} article(s))"
-        )
+            logger.info(
+                f"📦 Génération MP3 groupé : {mp3_name} ({len(entries)} article(s) du {date_bucket})…"
+            )
 
-        combined_text = _build_grouped_text(media, date_bucket, entries)
-        combined_text = clean_text_for_tts(combined_text)
+            combined_text = _build_grouped_text(media, date_bucket, entries)
+            combined_text = clean_text_for_tts(combined_text)
 
-        if len(combined_text) < 20:
-            logger.warning(f"Texte groupé trop court pour {mp3_name}, ignoré.")
-            remaining.extend(entries)
-            continue
+            if len(combined_text) < 20:
+                logger.warning(f"Texte groupé trop court pour {mp3_name}, ignoré.")
+                remaining.extend(entries)
+                continue
 
-        try:
-            await generate_tts_file(combined_text, voice, mp3_path)
-        except Exception as e:
-            logger.error(f"Erreur TTS pour le MP3 groupé {mp3_name} : {e}")
-            remaining.extend(entries)
-            continue
-
-        # Tags ID3 du MP3 groupé
-        try:
             try:
-                audio = ID3(mp3_path)
-            except Exception:
-                audio = ID3()
-            audio.add(TIT2(encoding=3, text=f"Résumés {media} du {date_bucket}"))
-            audio.add(TPE1(encoding=3, text="IA Résumé"))
-            audio.add(TALB(encoding=3, text=media))
-            audio.save(mp3_path)
-        except Exception as e:
-            logger.warning(f"Impossible d'écrire les tags ID3 pour {mp3_name} : {e}")
+                await generate_tts_file(combined_text, voice, mp3_path)
+            except Exception as e:
+                logger.error(f"❌ Erreur TTS pour le MP3 groupé {mp3_name} : {e}")
+                remaining.extend(entries)
+                continue
 
-        logger.info(f"MP3 groupé généré avec succès : {mp3_path}")
+            # Tags ID3 du MP3 groupé
+            try:
+                try:
+                    audio = ID3(mp3_path)
+                except Exception:
+                    audio = ID3()
+                audio.add(TIT2(encoding=3, text=f"Résumés {media} du {date_bucket}"))
+                audio.add(TPE1(encoding=3, text="IA Résumé"))
+                audio.add(TALB(encoding=3, text=media))
+                audio.save(mp3_path)
+            except Exception as e:
+                logger.warning(f"Impossible d'écrire les tags ID3 pour {mp3_name} : {e}")
 
-    # Sauvegarder uniquement les entrées non traitées
-    data["pending"] = remaining
-    save_grouped_summaries(data)
+            logger.info(f"✅ MP3 groupé généré avec succès : {mp3_name}")
+
+        # Sauvegarder uniquement les entrées non traitées
+        data["pending"] = remaining
+        save_grouped_summaries(data)
 
 
 async def process_rss_feed(feed_config, processed_urls, limit=None):
@@ -627,7 +780,7 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
                 links_to_save.append(link)
                 processed_urls.add(link)
         if links_to_save:
-            save_processed_urls(links_to_save)
+            await save_processed_urls_async(links_to_save)
         logger.info(f"Marked {len(links_to_save)} existing articles from {feed_url} as read.")
         save_seen_feed(feed_url)
         return
@@ -642,52 +795,55 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
             new_entries.append(entry)
 
     if not new_entries:
-        logger.info(f"No new entries in feed {feed_url}")
+        logger.info(f"✓ Aucun nouvel article dans {feed_url}")
         return
 
     # If limit is set, we only keep the N latest entries
     if limit is not None:
         new_entries = new_entries[:limit]
-        logger.info(f"Limiting to {len(new_entries)} latest articles for RSS feed.")
+        logger.info(f"Limite appliquée : {len(new_entries)} derniers articles.")
 
-    logger.info(f"Found {len(new_entries)} new entries to process from {feed_url}")
+    total = len(new_entries)
+    logger.info(f"→ {total} nouvel{'s' if total > 1 else ''} article{'s' if total > 1 else ''} à traiter (concurrence max active).")
 
-    # Process each new entry
-    for entry in new_entries:
-        link = entry.get("link")
-        title = entry.get("title", "Untitled Article")
-        
-        logger.info(f"Processing RSS Entry: {title} ({link})")
-        
+    # Process each new entry concurrently
+    async def process_single_entry(idx, entry):
+        tag = f"[{idx}/{total}]"
+        link = entry.get("link", "")
+        raw_title = entry.get("title", "Sans titre").strip()
+        short_title = (raw_title[:65] + "…") if len(raw_title) > 65 else raw_title
+
+        logger.info(f"{tag} 📥 Traitement : \"{short_title}\"")
+
         try:
             # Download article HTML
             def fetch_html(url):
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req, timeout=15) as response:
                     return response.read()
-            
+
             html_bytes = await loop.run_in_executor(None, fetch_html, link)
             soup = BeautifulSoup(html_bytes, 'html.parser')
-            
+
             # Use article title as filename hint
-            filename_hint = clean_filename(title) + ".html"
-            
+            filename_hint = clean_filename(raw_title) + ".html"
+
             # Get Adapter
             adapter = get_adapter(soup, filename_hint)
-            
+
             # Extract metadata and merge/override with RSS data
             meta = adapter.extract_metadata()
-            
-            if title:
-                meta["title"] = title
+
+            if raw_title:
+                meta["title"] = raw_title
             if link:
                 meta["url"] = link
-                
+
             # If date is missing, try to extract from entry
             if not meta.get("date") and entry.get("published_parsed"):
                 tm = entry.published_parsed
                 meta["date"] = f"{tm.tm_year:04d}-{tm.tm_mon:02d}-{tm.tm_mday:02d}"
-                
+
             # If description is missing, use summary
             if not meta.get("description") and entry.get("summary"):
                 summary_soup = BeautifulSoup(entry.summary, 'html.parser')
@@ -697,39 +853,39 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
             safe_title = clean_filename(meta["title"])
             media = meta.get("media", "Unknown Media")
             safe_media = clean_filename(media)
-            
+
             if safe_media and safe_media != "Unknown_Media":
                 mp3_name = f"{safe_title} - {safe_media}.mp3"
             else:
                 mp3_name = f"{safe_title}.mp3"
-                
+
             # Limit length to 120 characters to avoid sync issues (e.g. with Nextcloud)
             mp3_name = limit_filename(mp3_name, 120)
-                
+
             # Generate body content
             text_body = adapter.get_content()
             if len(text_body) < 50:
-                logger.warning(f"Skipping RSS entry '{title}': content too short or empty.")
-                save_processed_url(link)
-                processed_urls.add(link)
-                continue
+                logger.warning(f"{tag} Contenu trop court ({len(text_body)} car.), article ignoré.")
+                await save_processed_url_async(link)
+                async with _processed_urls_lock:
+                    processed_urls.add(link)
+                return
 
             # --- RÉSUMÉ IA (optionnel, configuré par flux) ---
             if should_summarize:
-                logger.info(f"Résumé IA activé pour '{title[:60]}' ({len(text_body)} chars)")
+                logger.info(f"{tag} 🤖 Résumé IA demandé ({len(text_body)} car.)…")
                 summarizer = get_summarizer()
                 try:
-                    text_body = await summarizer.summarize(text_body)
+                    text_body = await summarizer.summarize(text_body, label=tag)
                 except SummarizationError as e:
                     logger.error(
-                        f"Échec du résumé IA pour l'article '{title}': {e}. "
-                        "L'article est mis de côté pour être retenté ultérieurement."
+                        f"{tag} ❌ Échec du résumé IA ({e}). Mis de côté pour une prochaine exécution."
                     )
-                    continue
+                    return
 
                 if group_window_hours:
                     # Accumuler dans grouped_summaries.json, pas de MP3 individuel
-                    store_pending_summary(
+                    await store_pending_summary_async(
                         feed_url=feed_url,
                         media=meta.get("media", "Unknown Media"),
                         title=meta["title"],
@@ -739,12 +895,13 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
                         voice=feed_voice,
                         date_bucket=meta.get("date"),
                     )
-                    save_processed_url(link)
-                    processed_urls.add(link)
+                    await save_processed_url_async(link)
+                    async with _processed_urls_lock:
+                        processed_urls.add(link)
                     logger.info(
-                        f"Résumé mis en attente (groupe {group_window_hours}h) : {title[:60]}"
+                        f"{tag} 📋 Résumé mis en attente (groupe {group_window_hours}h)"
                     )
-                    continue
+                    return
                 # else : text_body est maintenant le résumé → génération MP3 individuelle normale
             # --- FIN RÉSUMÉ IA ---
 
@@ -755,16 +912,26 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
             mp3_path = os.path.join(target_dir, mp3_name)
 
             # Generate MP3 and save tags
+            logger.info(f"{tag} 🎙️ Génération MP3 : {mp3_name}")
             success = await generate_audio_from_content(meta, text_body, mp3_path, feed_voice)
             if success:
-                logger.info(f"Successfully converted RSS article to MP3: {mp3_path}")
-                save_processed_url(link)
-                processed_urls.add(link)
+                logger.info(f"{tag} ✅ MP3 généré avec succès")
+                await save_processed_url_async(link)
+                async with _processed_urls_lock:
+                    processed_urls.add(link)
             else:
-                logger.error(f"Failed to generate MP3 for RSS article: {title}")
-                
+                logger.error(f"{tag} ❌ Échec de génération MP3 pour : {mp3_name}")
+
         except Exception as e:
-            logger.error(f"Error processing RSS entry '{title}': {e}", exc_info=True)
+            logger.error(f"{tag} ❌ Erreur sur l'article '{short_title}': {e}", exc_info=True)
+
+    async def process_with_stagger(idx, entry):
+        if idx > 1:
+            await asyncio.sleep(min((idx - 1) * 0.2, 2.0))
+        await process_single_entry(idx, entry)
+
+    tasks = [process_with_stagger(i, entry) for i, entry in enumerate(new_entries, 1)]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def process_html_file(filepath):
@@ -890,6 +1057,11 @@ def main_test(test_dir):
 
 
 async def main(rss_limit=None):
+    start_time = time.monotonic()
+    logger.info("═" * 68)
+    logger.info("🎙️  TTS_Mp3 — Démarrage de la conversion & des résumés IA")
+    logger.info("═" * 68)
+
     # Ensure directories exist
     dirs_to_create = {
         INPUT_DIR,
@@ -908,11 +1080,11 @@ async def main(rss_limit=None):
                 return
 
     # --- PROCESS LOCAL HTML FILES ---
-    logger.info("Starting scan for local HTML files...")
+    logger.info("📂 Analyse des fichiers HTML locaux…")
     try:
         files = sorted(os.listdir(INPUT_DIR))
     except FileNotFoundError:
-        logger.error(f"Input directory not found: {INPUT_DIR}")
+        logger.error(f"Dossier introuvable : {INPUT_DIR}")
         files = []
 
     html_files = []
@@ -927,8 +1099,7 @@ async def main(rss_limit=None):
             html_files.append(filepath)
     
     if html_files:
-        logger.info(f"Found {len(html_files)} HTML file(s) to process.")
-        # Use a semaphore to process multiple files in parallel safely
+        logger.info(f"📂 Trouvé {len(html_files)} fichier(s) HTML à convertir.")
         sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
         
         async def safe_process(filepath):
@@ -937,23 +1108,29 @@ async def main(rss_limit=None):
                 
         tasks = [safe_process(filepath) for filepath in html_files]
         await asyncio.gather(*tasks)
-        logger.info("All local HTML files processed.")
+        logger.info("📂 Traitement des fichiers HTML locaux terminé.")
     else:
-        logger.info("No new local HTML files found.")
+        logger.info("📂 Aucun nouveau fichier HTML local.")
 
     # --- PROCESS RSS FEEDS ---
     if RSS_FEEDS:
-        logger.info("Starting RSS feeds processing...")
+        logger.info(f"📡 Analyse de {len(RSS_FEEDS)} flux RSS…")
         processed_urls = load_processed_urls()
         try:
             for feed_config in RSS_FEEDS:
                 await process_rss_feed(feed_config, processed_urls, limit=rss_limit)
-            logger.info("All RSS feeds processed.")
         finally:
             # Générer les MP3 groupés pour les fenêtres calendaires fermées
+            logger.info("📦 Vérification des résumés groupés à générer…")
             await flush_grouped_summaries()
     else:
-        logger.info("No RSS feeds configured.")
+        logger.info("📡 Aucun flux RSS configuré.")
+
+    elapsed = time.monotonic() - start_time
+    mins, secs = divmod(int(elapsed), 60)
+    logger.info("═" * 68)
+    logger.info(f"✨ Traitement terminé avec succès en {mins}m {secs:02d}s")
+    logger.info("═" * 68)
 
 if __name__ == "__main__":
     # Parse command line arguments
