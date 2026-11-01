@@ -116,6 +116,29 @@ class TestLoadConfig(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_load_default_timeout(self):
+        """Si timeout n'est pas spécifié, la valeur par défaut est 180s."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(VALID_CONFIG, f)
+            path = f.name
+        try:
+            config = load_gemini_config(path)
+            self.assertEqual(config["timeout"], 180)
+        finally:
+            os.unlink(path)
+
+    def test_load_custom_timeout(self):
+        """Prend en compte un timeout personnalisé."""
+        custom_config = {**VALID_CONFIG, "timeout": 240}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(custom_config, f)
+            path = f.name
+        try:
+            config = load_gemini_config(path)
+            self.assertEqual(config["timeout"], 240)
+        finally:
+            os.unlink(path)
+
 
 class TestRateLimiting(unittest.TestCase):
     """Tests du rate limiter."""
@@ -201,6 +224,24 @@ class TestSummarizeSuccess(unittest.TestCase):
             result = _run(self._summarizer.summarize(article))
 
         self.assertEqual(result, "Ceci est un résumé de test.")
+
+    def test_summarize_uses_configured_timeout(self):
+        """requests.post est appelé avec le timeout configuré (180s par défaut)."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = VALID_API_RESPONSE
+
+        article = "Ceci est un long article sur la technologie. " * 20
+        captured_timeout = []
+
+        def capture_post(url, params=None, json=None, timeout=None):
+            captured_timeout.append(timeout)
+            return mock_resp
+
+        with patch("requests.post", side_effect=capture_post):
+            _run(self._summarizer.summarize(article))
+
+        self.assertEqual(captured_timeout, [180])
 
     def test_summarize_uses_prompt_template(self):
         """Le prompt envoyé à l'API contient bien le texte de l'article."""
@@ -289,15 +330,41 @@ class TestSummarizeErrorHandling(unittest.TestCase):
         self.assertEqual(result, short)
 
     def test_empty_candidates_raises_exception(self):
-        """Si l'API renvoie des candidates vides, lève SummarizationError."""
+        """Si l'API renvoie des candidates vides, lève SummarizationError après retries."""
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {"candidates": []}
 
         article = "Texte original de l'article assez long pour être traité correctement."
-        with patch("requests.post", return_value=mock_resp):
+        with patch("requests.post", return_value=mock_resp), \
+             patch("time.sleep"):
             with self.assertRaises(SummarizationError):
                 _run(self._summarizer.summarize(article))
+
+    def test_thinking_only_response_retries_and_succeeds(self):
+        """Si une tentative ne renvoie que des parts thought, l'API est retentée et réussit si la suivante contient du texte."""
+        # Tentative 1 : uniquement thought
+        resp1 = MagicMock()
+        resp1.status_code = 200
+        resp1.json.return_value = [
+            {"candidates": [{"content": {"parts": [{"thought": True, "text": "Réflexion interne..."}]}}]}
+        ]
+
+        # Tentative 2 : thought + texte final
+        resp2 = MagicMock()
+        resp2.status_code = 200
+        resp2.json.return_value = [
+            {"candidates": [{"content": {"parts": [{"thought": True, "text": "Réflexion..."}, {"thought": False, "text": "Résumé final réussi."}]}}]}
+        ]
+
+        article = "Texte original de l'article avec suffisamment de texte pour dépasser les 50 caractères requis."
+        with patch("requests.post", side_effect=[resp1, resp2]) as mock_post, \
+             patch("time.sleep") as mock_sleep:
+            result = _run(self._summarizer.summarize(article))
+
+        self.assertEqual(result, "Résumé final réussi.")
+        self.assertEqual(mock_post.call_count, 2)
+        mock_sleep.assert_called_once_with(summarizer_module.RETRY_BASE_DELAY)
 
     def test_retry_delays_include_last_delay_2min(self):
         """Vérifie que les délais de retry sont 5s, 10s, 20s puis 120s pour la dernière tentative."""

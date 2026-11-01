@@ -269,6 +269,28 @@ class TestFlushGroupedSummaries(unittest.TestCase):
         self.assertEqual(len(data["pending"]), 1)
         self.assertEqual(data["pending"][0]["title"], "Nouveau")
 
+    def test_flush_tts_error_keeps_pending_and_removes_file(self):
+        """Si le TTS échoue lors du flush, les entrées restent dans pending et le fichier partiel est supprimé."""
+        entry = {**SAMPLE_ENTRY, "date_bucket": YESTERDAY}
+        self._write_pending([entry])
+
+        async def fake_save_fail(path):
+            with open(path, "wb") as f:
+                f.write(b"")  # simule le fichier 0-octet créé par edge_tts avant exception
+            raise RuntimeError("TTS error 403")
+
+        mock_communicate = MagicMock()
+        mock_communicate.save = fake_save_fail
+
+        with patch("edge_tts.Communicate", return_value=mock_communicate), \
+             patch("asyncio.sleep"):
+            _run(h2m.flush_grouped_summaries())
+
+        data = h2m.load_grouped_summaries()
+        self.assertEqual(len(data["pending"]), 1)
+        expected_file = os.path.join(self._out_dir, f"Resumes_Developpezcom_{YESTERDAY}.mp3")
+        self.assertFalse(os.path.exists(expected_file))
+
     def test_grouped_mp3_filename(self):
         """Le nom du MP3 groupé suit le format Resumes_{media}_{date}.mp3."""
         entry = {**SAMPLE_ENTRY, "date_bucket": YESTERDAY}

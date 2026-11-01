@@ -59,6 +59,41 @@ PROCESSED_URLS_FILE = os.path.join(_BASE_DIR, "processed_urls.json")
 SEEN_FEEDS_FILE = os.path.join(_BASE_DIR, "seen_feeds.json")
 GROUPED_SUMMARIES_FILE = os.path.join(_BASE_DIR, "grouped_summaries.json")
 
+# Configuration TTS et retries
+TTS_MAX_RETRIES = 3
+TTS_RETRY_BASE_DELAY = 3.0
+
+
+async def generate_tts_file(text: str, voice: str, mp3_path: str, max_retries: int = TTS_MAX_RETRIES) -> None:
+    """
+    Génère un fichier MP3 via edge-tts avec mécanisme de retry en cas d'erreur transitoire
+    (ex: déconnexion websocket, NoAudioReceived, throttling temporaire).
+    Supprime tout fichier incomplet ou vide en cas d'échec.
+    """
+    last_exc = RuntimeError("Aucune tentative effectuée")
+    for attempt in range(1, max_retries + 1):
+        try:
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(mp3_path)
+            if os.path.exists(mp3_path) and os.path.getsize(mp3_path) == 0:
+                raise RuntimeError(f"Fichier audio généré vide (0 octet) : {mp3_path}")
+            return
+        except Exception as e:
+            last_exc = e
+            if os.path.exists(mp3_path):
+                try:
+                    os.remove(mp3_path)
+                except OSError:
+                    pass
+            if attempt < max_retries:
+                wait = TTS_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    f"TTS tentative {attempt}/{max_retries} échouée pour '{os.path.basename(mp3_path)}' ({e}). "
+                    f"Nouvelle tentative dans {wait:.0f}s…"
+                )
+                await asyncio.sleep(wait)
+    raise last_exc
+
 
 def get_output_dir_for_source(source_type: str) -> str:
     """
@@ -338,8 +373,7 @@ async def generate_audio_from_content(meta, text_body, mp3_path, voice=VOICE):
     logger.debug(f"Content Preview: {full_content[:100]}...")
     
     try:
-        communicate = edge_tts.Communicate(full_content, voice)
-        await communicate.save(mp3_path)
+        await generate_tts_file(full_content, voice, mp3_path)
     except Exception as e:
         logger.error(f"Failed to generate TTS audio for '{title}': {e}")
         return False
@@ -525,8 +559,7 @@ async def flush_grouped_summaries() -> None:
             continue
 
         try:
-            communicate = edge_tts.Communicate(combined_text, voice)
-            await communicate.save(mp3_path)
+            await generate_tts_file(combined_text, voice, mp3_path)
         except Exception as e:
             logger.error(f"Erreur TTS pour le MP3 groupé {mp3_name} : {e}")
             remaining.extend(entries)
@@ -912,12 +945,13 @@ async def main(rss_limit=None):
     if RSS_FEEDS:
         logger.info("Starting RSS feeds processing...")
         processed_urls = load_processed_urls()
-        for feed_config in RSS_FEEDS:
-            await process_rss_feed(feed_config, processed_urls, limit=rss_limit)
-        logger.info("All RSS feeds processed.")
-
-        # Générer les MP3 groupés pour les fenêtres calendaires fermées
-        await flush_grouped_summaries()
+        try:
+            for feed_config in RSS_FEEDS:
+                await process_rss_feed(feed_config, processed_urls, limit=rss_limit)
+            logger.info("All RSS feeds processed.")
+        finally:
+            # Générer les MP3 groupés pour les fenêtres calendaires fermées
+            await flush_grouped_summaries()
     else:
         logger.info("No RSS feeds configured.")
 

@@ -26,6 +26,9 @@ GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model
 # Longueur maximale du texte envoyé à l'API (en caractères) pour éviter de dépasser les quotas de tokens
 MAX_TEXT_LENGTH = 8000
 
+# Délai d'attente réseau par défaut pour l'API Gemini (secondes)
+DEFAULT_TIMEOUT_SECONDS = 180
+
 # Délai initial entre tentatives en cas d'erreur API transitoire (secondes)
 RETRY_BASE_DELAY = 5.0
 # Délai avant la dernière tentative (secondes, 2 minutes)
@@ -79,6 +82,14 @@ def load_gemini_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
             f"max_requests_per_minute doit être un nombre entre 1 et 15 (reçu : {rpm})"
         )
 
+    # Timeout optionnel (secondes, défaut: DEFAULT_TIMEOUT_SECONDS)
+    raw_timeout = config.get("timeout") or config.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS
+    if not isinstance(raw_timeout, (int, float)) or raw_timeout <= 0:
+        raise ValueError(
+            f"timeout doit être un nombre positif en secondes (reçu : {raw_timeout})"
+        )
+    config["timeout"] = int(raw_timeout)
+
     return config
 
 
@@ -106,9 +117,11 @@ class GeminiSummarizer:
         self._prompt_template: str = self._config["prompt"]
         self._max_rpm: int = int(self._config["max_requests_per_minute"])
         self._min_interval: float = 60.0 / self._max_rpm
+        self._timeout: int = self._config.get("timeout", DEFAULT_TIMEOUT_SECONDS)
 
         logger.info(
             f"GeminiSummarizer initialisé — modèle : {self._model}, "
+            f"timeout : {self._timeout}s, "
             f"limite : {self._max_rpm} req/min (intervalle min : {self._min_interval:.1f}s)"
         )
 
@@ -207,7 +220,7 @@ class GeminiSummarizer:
         last_exc: Exception = RuntimeError("Aucune tentative effectuée")
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                response = requests.post(url, params=params, json=body, timeout=60)
+                response = requests.post(url, params=params, json=body, timeout=self._timeout)
             except Exception as e:
                 last_exc = e
                 if attempt < MAX_RETRIES:
@@ -219,52 +232,58 @@ class GeminiSummarizer:
                     _time.sleep(wait)
                 continue
 
-            if response.status_code == 200:
-                break
+            if response.status_code != 200:
+                if response.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
+                    wait = RETRY_LAST_DELAY if attempt == MAX_RETRIES - 1 else RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Gemini API tentative {attempt}/{MAX_RETRIES} — HTTP {response.status_code}. "
+                        f"Nouvelle tentative dans {wait:.0f}s…"
+                    )
+                    _time.sleep(wait)
+                    last_exc = RuntimeError(
+                        f"Gemini API erreur {response.status_code} : {response.text[:300]}"
+                    )
+                    continue
 
-            if response.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
-                wait = RETRY_LAST_DELAY if attempt == MAX_RETRIES - 1 else RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                logger.warning(
-                    f"Gemini API tentative {attempt}/{MAX_RETRIES} — HTTP {response.status_code}. "
-                    f"Nouvelle tentative dans {wait:.0f}s…"
-                )
-                _time.sleep(wait)
-                last_exc = RuntimeError(
+                raise RuntimeError(
                     f"Gemini API erreur {response.status_code} : {response.text[:300]}"
                 )
-                continue
 
-            raise RuntimeError(
-                f"Gemini API erreur {response.status_code} : {response.text[:300]}"
-            )
+            # streamGenerateContent renvoie un tableau JSON de chunks
+            # Chaque chunk a la même structure que generateContent.
+            # Les parts avec {"thought": true} contiennent le raisonnement interne
+            # (filtré) ; les autres contiennent la réponse finale.
+            try:
+                chunks = response.json()
+                if not isinstance(chunks, list):
+                    chunks = [chunks]  # fallback si l'API renvoie un objet unique
+
+                answer_parts = []
+                for chunk in chunks:
+                    candidates = chunk.get("candidates", [])
+                    if not candidates:
+                        continue
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    for p in parts:
+                        if not p.get("thought", False) and "text" in p:
+                            answer_parts.append(p["text"])
+
+                if not answer_parts:
+                    raise ValueError("Aucune part de réponse non-thinking trouvée")
+                summary_text = "".join(answer_parts).strip()
+                return summary_text
+            except (KeyError, IndexError, ValueError, json.JSONDecodeError) as e:
+                last_exc = e
+                if attempt < MAX_RETRIES:
+                    wait = RETRY_LAST_DELAY if attempt == MAX_RETRIES - 1 else RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Gemini API tentative {attempt}/{MAX_RETRIES} — {e} (réponse incomplète ou interruption). "
+                        f"Nouvelle tentative dans {wait:.0f}s…"
+                    )
+                    _time.sleep(wait)
+                continue
         else:
             raise last_exc
-
-        # streamGenerateContent renvoie un tableau JSON de chunks
-        # Chaque chunk a la même structure que generateContent.
-        # Les parts avec {"thought": true} contiennent le raisonnement interne
-        # (filtré) ; les autres contiennent la réponse finale.
-        try:
-            chunks = response.json()
-            if not isinstance(chunks, list):
-                chunks = [chunks]  # fallback si l'API renvoie un objet unique
-
-            answer_parts = []
-            for chunk in chunks:
-                candidates = chunk.get("candidates", [])
-                if not candidates:
-                    continue
-                parts = candidates[0].get("content", {}).get("parts", [])
-                for p in parts:
-                    if not p.get("thought", False) and "text" in p:
-                        answer_parts.append(p["text"])
-
-            if not answer_parts:
-                raise ValueError("Aucune part de réponse non-thinking trouvée")
-            summary_text = "".join(answer_parts).strip()
-            return summary_text
-        except (KeyError, IndexError) as e:
-            raise ValueError(f"Structure de réponse Gemini inattendue : {e}")
 
     async def summarize(self, text: str) -> str:
         """
