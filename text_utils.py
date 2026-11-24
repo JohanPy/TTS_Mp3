@@ -5,180 +5,429 @@ logger = logging.getLogger(__name__)
 
 # --- INCLUSIVE WRITING HANDLER ---
 
-# Homophones: mots qui s'écrivent différemment au masculin/féminin mais sonnent pareil
-# Le masculin suffit à l'oral
-HOMOPHONES_RACINES = {
-    # Terminaisons en -é (ami/amie, salarié/salariée)
-    "ami", "amie", "salari", "déput", "charg", "employ", "invit", "concern",
-    "abonn", "engag", "fatigu", "motiv", "détermin", "passionn", "diplôm",
-    "qualifi", "expériment", "intéress", "touch", "affect", "impliqu",
-    "préoccup", "inform", "consult", "réuni", "assembl", "group", "rassembl",
-    "marqu", "salu", "accompagn", "guid", "orient", "form", "sensibilis",
-    "mobilis", "organis", "structur", "coordonn", "délég", "mandaté",
-    "autoris", "habilit", "certifi", "agré", "reconnu", "validé",
-    # Autres terminaisons muettes
-    "auteur", "lecteur", "acteur", "directeur", "professeur"
-}
+_FEM_SUFFIXES = (
+    r'trice|trices|euse|euses|rice|rices|ice|ices|elle|elles|'
+    r'ère|ères|ive|ives|ne|nes|le|les|te|tes|se|ses|ve|ves|ce|ces|fe|fes|re|res|es|e'
+)
+
+_SINGULAR_OR_CONJ = {'un', 'aucun', 'chacun', 'quelqu\'un', 'quelqu’un'}
+
+_EXPLICIT_SLASH_REPLACEMENTS = [
+    (r'\b(il/elle/iel|elle/il/iel|il/elle|elle/il)\b', 'elle ou il'),
+    (r'\b(ils/elles/iels|elles/ils/iels|ils/elles|elles/ils)\b', 'elles et ils'),
+    (r'\b(celui/celle|celle/celui)\b', 'celle ou celui'),
+    (r'\b(ceux/celles|celles/ceux)\b', 'celles et ceux'),
+    (r'\b(le/la|la/le)\b', 'la ou le'),
+    (r'\b(un/une|une/un)\b', 'une ou un'),
+    (r'\b(mon/ma|ma/mon)\b', 'ma ou mon'),
+    (r'\b(son/sa|sa/son)\b', 'sa ou son'),
+    (r'\b(du/de la|de la/du)\b', 'de la ou du'),
+    (r'\b(au/à la|à la/au)\b', 'à la ou au'),
+]
+
+_NEOLOGISMES = [
+    (r'\bcelleux\b', 'celles et ceux'),
+    (r'\bceuxlles\b', 'ceux et celles'),
+    (r'\btoustes\b', 'toutes et tous'),
+    (r'\biels\b', 'elles et ils'),
+    (r'\biel\b', 'elle ou il'),
+]
+
+
+def _preserve_case(template: str, replacement: str) -> str:
+    """Préserve la majuscule initiale du mot source sur le remplacement."""
+    if not template or not replacement:
+        return replacement
+    if template[0].isupper():
+        return replacement[0].upper() + replacement[1:]
+    return replacement
+
 
 def _sonnent_pareil(masculin: str, feminin: str) -> bool:
     """
-    Détermine si le masculin et le féminin sonnent pareil à l'oral.
-    Utilise des règles phonétiques françaises + liste d'exceptions.
+    Détermine si le masculin et le féminin sonnent pareil à l'oral en français.
     """
     masc = masculin.lower().strip()
     fem = feminin.lower().strip()
-    
+
     if masc == fem:
         return True
-    
+
     masc_base = masc.rstrip('s')
     fem_base = fem.rstrip('s')
-    
-    for racine in HOMOPHONES_RACINES:
-        if masc_base.endswith(racine) or masc_base == racine:
+
+    if masc_base == fem_base:
+        return True
+
+    if (masc_base, fem_base) in {('fier', 'fière'), ('cher', 'chère')}:
+        return True
+
+    # Voyelle finale (é, i, u, o, a, y) ou r/l final + e muet :
+    # ami/amie, salarié/salariée, professeur/professeure, auteur/auteure, espagnol/espagnole
+    if fem_base == masc_base + 'e' and masc_base:
+        if masc_base[-1] in 'éèêëiîïuûüoôaàây':
             return True
-    
-    if fem_base.startswith(masc_base):
-        suffixe = fem_base[len(masc_base):]
-        if suffixe in ['e', 'es', '']:
-            if masc_base and masc_base[-1] in 'éèêëiîïuûüoôaàâ':
-                return True
-    
-    if masc.endswith('eur') and fem.endswith('euse'):
-        return False
-    if masc.endswith('teur') and fem.endswith('trice'):
-        return False
-    if masc.endswith('if') and fem.endswith('ive'):
-        return False
-    if masc.endswith('eux') and fem.endswith('euse'):
-        return False
-    
+        if masc_base[-1] == 'r' and not fem_base.endswith('ère'):
+            return True
+        if masc_base[-1] == 'l' and not masc_base.endswith('gentil'):
+            return True
+
+    # -el / -elle (professionnel/professionnelle, actuel/actuelle)
+    if masc_base.endswith('el') and fem_base == masc_base + 'le':
+        return True
+
     return False
 
-def _generer_forme_parlee(masculin: str, feminin: str) -> str:
+
+def _construire_formes(prefix: str, base: str, fem_suffix: str, is_plural: bool) -> tuple[str, str]:
+    """
+    Construit les formes (masculin, feminin) complètes à partir du préfixe élidé,
+    de la base, du suffixe féminin et du nombre.
+    """
+    base_low = base.lower()
+    fem_low = fem_suffix.lower()
+
+    # Cas particulier : tou·te·s / tous·tes
+    if base_low in ('tou', 'tous') and fem_low in ('te', 'tes'):
+        masc = 'tous'
+        fem = 'toutes'
+        return prefix + _preserve_case(base, masc), prefix + _preserve_case(base, fem)
+
+    # Masculin pluriel : éviter le double s (divers -> divers, Taïwanais -> Taïwanais)
+    if is_plural and not base_low.endswith(('s', 'x', 'z')):
+        masc_core = base + 's'
+    else:
+        masc_core = base
+
+    # Féminin selon l'alternance morphologique
+    plural_s = 's' if is_plural else ''
+    if base_low.endswith('teur') and fem_low in ('ice', 'ices', 'rice', 'rices', 'trice', 'trices'):
+        fem_core = base[:-3] + 'rice' + plural_s
+    elif base_low.endswith('eur') and fem_low in ('euse', 'euses', 'se', 'ses'):
+        fem_core = base[:-3] + 'euse' + plural_s
+    elif base_low.endswith('f') and fem_low in ('ve', 'ves', 'ive', 'ives'):
+        fem_core = base[:-1] + 've' + plural_s
+    elif base_low.endswith('x') and fem_low in ('se', 'ses', 'euse', 'euses'):
+        fem_core = base[:-1] + 'se' + plural_s
+    elif base_low.endswith('er') and fem_low in ('ère', 'ères', 'ere', 'eres'):
+        fem_core = base[:-2] + 'ère' + plural_s
+    elif base_low in ('fier', 'cher') and fem_low in ('e', 'es', 'ère', 'ères', 'ere', 'eres'):
+        fem_core = base[:-2] + 'ère' + plural_s
+    elif base_low.endswith('ier') and fem_low in ('e', 'es'):
+        fem_core = base[:-2] + 'ère' + plural_s
+    else:
+        fem_clean = fem_suffix[:-1] if (is_plural and fem_low.endswith('s') and len(fem_suffix) > 1) else fem_suffix
+        fem_core = base + fem_clean + plural_s
+
+    return prefix + masc_core, prefix + fem_core
+
+
+def _generer_forme_parlee(prefix: str, base: str, fem_suffix: str, is_plural: bool) -> str:
     """
     Génère la forme parlée d'un mot en écriture inclusive.
-    Retourne soit le masculin seul (si homophone), soit "féminin et masculin".
+    Retourne soit le masculin seul (si homophone), soit "féminin et/ou masculin".
     """
+    masculin, feminin = _construire_formes(prefix, base, fem_suffix, is_plural)
+
     if _sonnent_pareil(masculin, feminin):
         return masculin
-    else:
-        return f"{feminin} et {masculin}"
+
+    base_low = base.lower()
+    use_ou = (not is_plural) and (base_low in _SINGULAR_OR_CONJ or (prefix.lower() + base_low) in _SINGULAR_OR_CONJ)
+    conj = 'ou' if use_ou else 'et'
+
+    # Mettre en minuscule le second terme si le mot de départ avait une majuscule de début de phrase
+    # (sauf noms composés avec trait d'union comme Afro-Américains)
+    masc_out = masculin
+    if not prefix and masculin and masculin[0].isupper() and '-' not in base:
+        masc_out = masculin[0].lower() + masculin[1:]
+
+    return f"{feminin} {conj} {masc_out}"
+
 
 def process_inclusive_writing(text: str) -> str:
     """
     Convertit l'écriture inclusive en forme parlée pour TTS.
     """
     result = text
-    
-    neologismes = {
-        r'\bcelleux\b': 'celles et ceux',
-        r'\bceuxlles\b': 'ceux et celles',
-        r'\biels\b': 'elles et ils',
-        r'\biel\b': 'elle ou il',
-        r'\bae\b': 'a ou e',
-    }
-    for pattern, replacement in neologismes.items():
-        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
-    
-    def replace_full_pattern(match):
-        base = match.group(1)
-        suffix1 = match.group(2)
-        suffix2 = match.group(3)
-        
-        if suffix2:
-            masculin = base + suffix2
-            feminin = base + suffix1 + suffix2
-        else:
-            masculin = base
-            feminin = base + suffix1
-        
-        return _generer_forme_parlee(masculin, feminin)
-    
-    separateurs = r'[·\-\.\(\)]'
-    pattern_pluriel = rf'(\w+){separateurs}(\w+){separateurs}([s])\b'
-    result = re.sub(pattern_pluriel, replace_full_pattern, result)
-    
-    def replace_short_pattern(match):
-        base = match.group(1)
-        suffix = match.group(2)
-        
-        if suffix.endswith('s'):
-            masculin = base + 's'
-            feminin = base + suffix
-        else:
-            masculin = base
-            feminin = base + suffix
-        
-        return _generer_forme_parlee(masculin, feminin)
-    
-    pattern_court = rf'(\w+){separateurs}([eé]s?|ne|rice|euse|ive|se)\b'
-    result = re.sub(pattern_court, replace_short_pattern, result, flags=re.IGNORECASE)
-    
-    result = re.sub(r'·', ' ', result)
+
+    # 1. Formes avec barres obliques explicites (avant les néologismes)
+    for pattern, replacement in _EXPLICIT_SLASH_REPLACEMENTS:
+        result = re.sub(
+            pattern,
+            lambda m, r=replacement: _preserve_case(m.group(0), r),
+            result,
+            flags=re.IGNORECASE,
+        )
+
+    # 2. Néologismes inclusifs
+    for pattern, replacement in _NEOLOGISMES:
+        result = re.sub(
+            pattern,
+            lambda m, r=replacement: _preserve_case(m.group(0), r),
+            result,
+            flags=re.IGNORECASE,
+        )
+
+    prefix_pat = r"(?P<prefix>(?:[A-Za-zÀ-ÿ]+[’'])?)"
+    base_pat = r"(?P<base>[A-Za-zÀ-ÿ]+(?:-[A-Za-zÀ-ÿ]+)?)"
+
+    def _replace_match(match, force_plural=False):
+        prefix = match.group('prefix') or ''
+        base = match.group('base')
+        fem = match.group('fem')
+        has_pl = force_plural
+        if 'pl' in match.groupdict() and match.group('pl'):
+            has_pl = True
+        if not has_pl and fem.lower().endswith('s'):
+            has_pl = True
+        return _generer_forme_parlee(prefix, base, fem, has_pl)
+
+    # 3. Motif A : point médian (· ou •), 3 parties puis 2 parties
+    pat_median_3 = re.compile(
+        rf"\b{prefix_pat}{base_pat}[·•](?P<fem>{_FEM_SUFFIXES})[·•](?P<pl>s)\b",
+        flags=re.IGNORECASE,
+    )
+    result = pat_median_3.sub(lambda m: _replace_match(m, force_plural=True), result)
+
+    pat_median_2 = re.compile(
+        rf"\b{prefix_pat}{base_pat}[·•](?P<fem>{_FEM_SUFFIXES})\b",
+        flags=re.IGNORECASE,
+    )
+    result = pat_median_2.sub(lambda m: _replace_match(m), result)
+
+    # 4. Motif B : parenthèses appariées base(fem)(s) ou base(fem)s?
+    pat_paren = re.compile(
+        rf"\b{prefix_pat}{base_pat}\((?P<fem>{_FEM_SUFFIXES})\)(?:\((?P<pl>s)\)|(?P<pl2>s))?(?![A-Za-zÀ-ÿ])",
+        flags=re.IGNORECASE,
+    )
+    result = pat_paren.sub(
+        lambda m: _generer_forme_parlee(
+            m.group('prefix') or '',
+            m.group('base'),
+            m.group('fem'),
+            bool(m.group('pl') or m.group('pl2') or m.group('fem').lower().endswith('s')),
+        ),
+        result,
+    )
+
+    # 5. Motif C : point (.), 3 parties puis 2 parties (en évitant les URLs/domaines/emails)
+    pat_dot_3 = re.compile(
+        rf"\b{prefix_pat}{base_pat}\.(?P<fem>{_FEM_SUFFIXES})\.(?P<pl>s)\b",
+        flags=re.IGNORECASE,
+    )
+    result = pat_dot_3.sub(lambda m: _replace_match(m, force_plural=True), result)
+
+    pat_dot_2 = re.compile(
+        rf"\b{prefix_pat}{base_pat}\.(?P<fem>{_FEM_SUFFIXES})\b(?!/)",
+        flags=re.IGNORECASE,
+    )
+
+    def _replace_dot_2(match):
+        start = match.start()
+        ctx_before = result[max(0, start - 10):start].lower()
+        if any(tok in ctx_before for tok in ('http://', 'https://', 'www.', '@')):
+            return match.group(0)
+        return _replace_match(match)
+
+    result = pat_dot_2.sub(_replace_dot_2, result)
+
+    # 6. Motif D : trait d'union uniquement en 3 parties explicites (ex: tou-te-s, citoyen-ne-s)
+    pat_hyphen_3 = re.compile(
+        rf"\b{prefix_pat}(?P<base>[A-Za-zÀ-ÿ]+)-(?P<fem>{_FEM_SUFFIXES})-(?P<pl>s)\b",
+        flags=re.IGNORECASE,
+    )
+    result = pat_hyphen_3.sub(lambda m: _replace_match(m, force_plural=True), result)
+
+    # 7. Nettoyer tout point médian résiduel et normaliser les espaces
+    result = re.sub(r'[·•]', ' ', result)
     result = re.sub(r'\s+', ' ', result)
     return result
 
-def convertir_chiffres_romains(texte):
+
+# --- ROMAN NUMERALS & ORDINALS HANDLER ---
+
+_ROMAN_VALID_RE = re.compile(
+    r'^(?:M{0,3})(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})$'
+)
+_FEM_ORDINAL_NOUNS_RE = re.compile(
+    r'^\s*(?:République|guerre|Internationale|partie|section|édition|année|dynastie|croisade|chambre|classe|division|période|étape)\b',
+    re.IGNORECASE,
+)
+_ORDINAL_CONTEXT_AFTER_RE = re.compile(
+    r'^\s*(?:siècles?|arrondissements?|République|Reich|Internationale|guerres?|plans?|congrès|éditions?|années?|dynasties?|croisades?|millénaires?|av\.|ap\.|au\b|et\b)',
+    re.IGNORECASE,
+)
+_ORDINAL_CONTEXT_BEFORE_RE = re.compile(
+    r'\b(?:du|au|la|le|de|dès|depuis|avant|après|un|une|Paris|Lyon|Marseille)\s*$',
+    re.IGNORECASE,
+)
+
+_SOUVERAINS = (
+    r"Louis|Charles|Henri|Jean-Paul|Jean|Philippe|François|Guillaume|Benoît|Paul|Pie|"
+    r"Napoléon|Léopold|Léon|Élisabeth|Elizabeth|Nicolas|Pierre|Catherine|Alexandre|"
+    r"Frédéric|Georges|George|Édouard|Edward|Richard|Albert|Urbain|Innocent|Grégoire|"
+    r"Clément|Sixte|Victor-Emmanuel|Hassan|Mohammed|Ramsès|Ptolémée|Cyrus|Darius|"
+    r"Constantin|Justinien|Alphonse|Ferdinand|Isabelle|Jacques|Baudouin|Gustave|"
+    r"Christian|Oscar|Harald|Olav|Margrethe|Juan Carlos|Felipe"
+)
+_TITRES_SOUVERAINS = r"pape|roi|reine|empereur|impératrice|tsar|tsarine|duc|duchesse|prince|princesse"
+_STRUCT_MOTS = r"chapitre|tome|partie|livre|volume|acte|scène|article|annexe|section|épisode|saison|numéro|concile\s+Vatican|Vatican"
+
+
+def _roman_to_int(s: str) -> int:
+    """Convertit un chiffre romain strictement valide (majuscules) en entier."""
+    if not s or not _ROMAN_VALID_RE.match(s):
+        return 0
+    rom_val = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100, 'D': 500, 'M': 1000}
+    int_val = 0
+    for i, ch in enumerate(s):
+        val = rom_val[ch]
+        if i + 1 < len(s) and rom_val[s[i + 1]] > val:
+            int_val -= val
+        else:
+            int_val += val
+    return int_val
+
+
+def _format_ordinal(val: int, suffix: str, context_after: str = '') -> str:
+    """Formate un ordinal numérique lisible par VivienneNeural."""
+    if val == 1:
+        suf = suffix.lower()
+        if suf in ('ère', 'ere', 're'):
+            return '1re'
+        if suf == 'er':
+            return '1er'
+        if _FEM_ORDINAL_NOUNS_RE.match(context_after):
+            return '1re'
+        return '1er'
+    return f"{val}e"
+
+
+def convertir_chiffres_romains(texte: str) -> str:
     """
-    Convertit les chiffres romains (I, V, X) en chiffres arabes dans des contextes spécifiques
-    (siècles, arrondissements, noms de souverains) pour faciliter la lecture par le TTS.
+    Convertit les chiffres romains en chiffres arabes (ou ordinaux) dans les contextes
+    appropriés (siècles, Républiques, arrondissements, souverains, références structurelles)
+    et réattache les suffixes ordinaux détachés par des balises <sup>.
     """
-    def roman_to_int(s):
-        rom_val = {'I': 1, 'V': 5, 'X': 10}
-        int_val = 0
-        s = s.upper()
-        for i in range(len(s)):
-            if s[i] not in rom_val:
-                continue
-            if i > 0 and rom_val[s[i]] > rom_val[s[i - 1]]:
-                int_val += rom_val[s[i]] - 2 * rom_val[s[i - 1]]
-            else:
-                int_val += rom_val[s[i]]
-        return int_val
+    result = texte
 
-    def replace_siecle(match):
-        roman = match.group(1)
-        mot_siecle = match.group(3)
-        val = roman_to_int(roman)
-        if val == 1:
-            return f"1er {mot_siecle}"
-        return f"{val}ème {mot_siecle}"
+    # 2a. Réattacher les suffixes ordinaux détachés après chiffres arabes (ex: "1 er mai" -> "1er mai")
+    result = re.sub(r'\b(\d+)\s+(er|ère|ere|re|ème|eme|e)\b(?![-\w])', r'\1\2', result)
 
-    texte = re.sub(r'\b([IVX]+)(e|ème|eme|er)?\s+(siècle|siecles|siècles)\b',
-                   replace_siecle, texte, flags=re.IGNORECASE)
+    # 2a-bis. Réattacher et convertir les chiffres romains suivis d'un suffixe ordinal détaché (ex: "XIX e siècle")
+    def _replace_detached_roman(match):
+        rom = match.group(1)
+        suf = match.group(2)
+        val = _roman_to_int(rom)
+        if not (1 <= val <= 39):
+            return match.group(0)
+        after = result[match.end():match.end() + 40]
+        before = result[max(0, match.start() - 25):match.start()]
+        if (
+            len(rom) >= 2
+            or suf.lower() in ('er', 'ère', 'ere', 're', 'ème', 'eme')
+            or _ORDINAL_CONTEXT_AFTER_RE.match(after)
+            or _ORDINAL_CONTEXT_BEFORE_RE.search(before)
+        ):
+            return _format_ordinal(val, suf, after)
+        return match.group(0)
 
-    def replace_arrond(match):
-        roman = match.group(1)
-        mot_arrond = match.group(3)
-        val = roman_to_int(roman)
-        if val == 1:
-            return f"1er {mot_arrond}"
-        return f"{val}ème {mot_arrond}"
+    result = re.sub(
+        r'\b([IVX]+)\s+(er|ère|ere|re|ème|eme|e)\b(?![-\w’\'])',
+        _replace_detached_roman,
+        result,
+    )
 
-    texte = re.sub(r'\b([IVX]+)(e|ème|eme|er)?\s+(arrondissement|arrondissements)\b',
-                   replace_arrond, texte, flags=re.IGNORECASE)
+    # 2b. Chiffres romains attachés à un suffixe ordinal (ex: XVIIIe, Vème, VIe, Ier, Ire)
+    def _replace_attached_roman(match):
+        rom = match.group(1)
+        suf = match.group(2)
+        val = _roman_to_int(rom)
+        if not (1 <= val <= 39):
+            return match.group(0)
+        after = result[match.end():match.end() + 40]
+        return _format_ordinal(val, suf, after)
 
-    def replace_ville_arrond(match):
+    result = re.sub(
+        r'\b([IVX]+)(er|ère|ere|re|ème|eme|e)\b',
+        _replace_attached_roman,
+        result,
+    )
+
+    # 2c. Arrondissements sans suffixe (Paris IV -> Paris 4e)
+    def _replace_ville_arrond(match):
         ville = match.group(1)
-        roman = match.group(2)
-        val = roman_to_int(roman)
-        return f"{ville} {val}"
+        val = _roman_to_int(match.group(2))
+        if not (1 <= val <= 20):
+            return match.group(0)
+        return f"{ville} {_format_ordinal(val, 'e')}"
 
-    texte = re.sub(r'\b(Paris|Lyon|Marseille)\s+([IVX]+)(e|ème)?\b', replace_ville_arrond, texte)
+    result = re.sub(r'\b(Paris|Lyon|Marseille)\s+([IVX]+)\b', _replace_ville_arrond, result)
 
-    def replace_souverain(match):
+    # 2d. Souverains, papes et personnages historiques (espace ou trait d'union)
+    def _replace_souverain(match):
         nom = match.group(1)
-        roman = match.group(2)
-        val = roman_to_int(roman)
+        val = _roman_to_int(match.group(2))
+        if not (1 <= val <= 39):
+            return match.group(0)
         if val == 1:
             return f"{nom} 1er"
         return f"{nom} {val}"
 
-    noms_rois = r"(Louis|Charles|Henri|Jean|Philippe|François|Guillaume|Benoît|Paul|Pie|Jean-Paul|Napoléon|Léopold)"
-    texte = re.sub(r'\b' + noms_rois + r'\s+([IVX]+)(er|e)?\b', replace_souverain, texte)
+    result = re.sub(
+        rf'\b({_SOUVERAINS})[\s-]+([IVX]+)\b',
+        _replace_souverain,
+        result,
+    )
 
-    return texte
+    def _replace_titre_souverain(match):
+        titre = match.group(1)
+        nom = match.group(2)
+        val = _roman_to_int(match.group(3))
+        if not (1 <= val <= 39):
+            return match.group(0)
+        if val == 1:
+            return f"{titre} {nom} 1er"
+        return f"{titre} {nom} {val}"
+
+    result = re.sub(
+        rf'\b({_TITRES_SOUVERAINS})\s+([A-ZÀ-Ÿ][a-zà-ÿ\-]+)[\s-]+([IVX]+)\b',
+        _replace_titre_souverain,
+        result,
+        flags=re.IGNORECASE,
+    )
+
+    # 2e. Références structurelles (chapitre IV, tome II, Vatican II...)
+    def _replace_struct(match):
+        mot = match.group(1)
+        val = _roman_to_int(match.group(2))
+        if not (1 <= val <= 39):
+            return match.group(0)
+        return f"{mot} {val}"
+
+    result = re.sub(
+        rf'\b({_STRUCT_MOTS})\s+([IVX]+)\b',
+        lambda m: _replace_struct(m) if m.group(1).lower() in (
+            'chapitre', 'tome', 'partie', 'livre', 'volume', 'acte', 'scène',
+            'article', 'annexe', 'section', 'épisode', 'saison', 'numéro',
+            'vatican', 'concile vatican'
+        ) or re.match(r'^concile\s+vatican$', m.group(1), re.I) else m.group(0),
+        result,
+        flags=re.IGNORECASE,
+    )
+
+    return result
+
+
+# --- TEXT CLEANING & NORMALIZATION FOR TTS ---
+
+_TECH_WHITELIST = {
+    'base64', 'utf8', 'ipv4', 'ipv6', 'http2', 'html5', 'css3',
+    'sqlite3', 'sha1', 'sha256', 'web3', 'llama3', 'python3',
+    'gemini4', 'covid19',
+}
+
 
 def clean_text_for_tts(text: str) -> str:
     """
@@ -187,41 +436,39 @@ def clean_text_for_tts(text: str) -> str:
     - Sections interactives et boilerplate
     """
     result = text
-    
+
     # 1. Supprimer les URLs (http://, https://, www.)
     result = re.sub(r'https?://[^\s\)]+', '', result)
     result = re.sub(r'www\.[^\s\)]+', '', result)
-    
+
     # 2. Supprimer les DOI
     result = re.sub(r'doi\.org/[^\s\)]+', '', result)
     result = re.sub(r'https?://doi\.org/[^\s]+', '', result)
     result = re.sub(r'\bdoi\s*:\s*[^\s]+', '', result, flags=re.IGNORECASE)
-    
-    # 3. Supprimer les numéros de notes entre crochets [1], [2], etc.
-    result = re.sub(r'\[\d+\]', '', result)
-    
-    # 4. Supprimer les appels de notes (numéros seuls en exposant ou après un mot)
-    result = re.sub(r'(?<=[a-zA-Zà-ÿ])\d{1,2}(?=[\.,;:!?])', '', result)
-    
-    # 5. Supprimer les références bibliographiques typiques
-    result = re.sub(r'\b[A-Z][a-zà-ÿ]+,\s*[A-Z]\.\s*(?:&\s*[A-Z][a-zà-ÿ]+,\s*[A-Z]\.\s*)*\(\d{4}\)\.\s*[^\.]+\.[^\.]*(?:Presses|Éditions|University|Press|Gallimard|Seuil)[^\.]*\.', '', result)
-    
-    # 6. Supprimer les mentions de licence Creative Commons
+
+    # 3. Supprimer les références bibliographiques typiques
+    result = re.sub(
+        r'\b[A-Z][a-zà-ÿ]+,\s*[A-Z]\.\s*(?:&\s*[A-Z][a-zà-ÿ]+,\s*[A-Z]\.\s*)*\(\d{4}\)\.\s*[^\.]+\.[^\.]*(?:Presses|Éditions|University|Press|Gallimard|Seuil)[^\.]*\.',
+        '',
+        result,
+    )
+
+    # 4. Supprimer les mentions de licence Creative Commons
     result = re.sub(r'(CC\s+BY[-\w]*|Creative\s+Commons|Tous\s+droits\s+réservés)[^\.]*\.?', '', result, flags=re.IGNORECASE)
     result = re.sub(r'Le texte seul est utilisable sous licence[^\.]+\.', '', result, flags=re.IGNORECASE)
-    
-    # 7. Supprimer les références électroniques
+
+    # 5. Supprimer les références électroniques
     result = re.sub(r'Référence électronique[^\.]*\.?', '', result, flags=re.IGNORECASE)
     result = re.sub(r'\[En ligne\][^,]*,', '', result, flags=re.IGNORECASE)
     result = re.sub(r'mis en ligne le[^,\.]+[,\.]', '', result, flags=re.IGNORECASE)
     result = re.sub(r'consulté le \d+[^\.]+\.', '', result, flags=re.IGNORECASE)
     result = re.sub(r'URL\s*:', '', result, flags=re.IGNORECASE)
-    
-    # 8. Supprimer les mentions "Paru dans..." "Articles du même auteur"
+
+    # 6. Supprimer les mentions "Paru dans..." "Articles du même auteur"
     result = re.sub(r'Paru dans[^\.]+\.', '', result, flags=re.IGNORECASE)
     result = re.sub(r'Articles? du même auteur\.?', '', result, flags=re.IGNORECASE)
 
-    # 9. Supprimer les sections interactives et boilerplate
+    # 7. Supprimer les sections interactives et boilerplate
     noise_cutoff_patterns = [
         r'"Et vous\s*\?"',
         r'"Et vous aussi"',
@@ -238,22 +485,77 @@ def clean_text_for_tts(text: str) -> str:
         m = re.search(pattern, result, flags=re.IGNORECASE)
         if m:
             result = result[:m.start()]
-    
-    # 10. Supprimer les notes numérotées en début de phrase
-    result = re.sub(r'\.\s+\d{1,2}\s+[A-Z][^\.]{10,150}(?:\.\.\.|\.\s)', '. ', result)
-    
-    # 11. Nettoyer les doubles espaces et ponctuation orpheline
+
+    # 8. Appels de notes numériques entre crochets [1], [ 12 ], [1, 2], [1-3]
+    result = re.sub(r'\[\s*\d+(?:\s*[-–,]\s*\d+)*\s*\]', '', result)
+
+    # 9. Ellipses entre crochets […] ou [.] -> ...
+    result = re.sub(r'\[\s*(?:…|\.{2,3}|\.)\s*\]', '...', result)
+
+    # 10. Crochets éditoriaux ([son], [le ministre – ndlr]) -> contenu sans crochets
+    result = re.sub(r'\[([^\]]+)\]', r'\1', result)
+    result = re.sub(r'\bndlr\b', 'note de la rédaction', result, flags=re.IGNORECASE)
+
+    # 11. Appels de notes en exposant Unicode après au moins 3 lettres minuscules (épargne m², km²)
+    result = re.sub(r'\b([a-zà-ÿ]{3,})[¹²³⁴⁵⁶⁷⁸⁹⁰]+', r'\1', result)
+
+    # 12. Appels de notes collés uniquement après mot tout en minuscules >= 4 lettres (épargne TF1, N3, CO2, G20, MD5, R1...)
+    def _strip_footnote_digit(match):
+        whole = match.group(0)
+        word = match.group(1)
+        if whole.lower() in _TECH_WHITELIST:
+            return whole
+        return word
+
+    result = re.sub(r'\b([a-zà-ÿ]{4,})\d{1,2}(?=[\.,;:!?])', _strip_footnote_digit, result)
+
+    # 13. Réduire les guillemets doublés/triplés
+    result = re.sub(r'"{2,}', '"', result)
+
+    # 14. Nettoyer les doubles espaces et ponctuation orpheline (en préservant les points de suspension ...)
     result = re.sub(r'\s+', ' ', result)
     result = re.sub(r'\s+([.,;:!?])', r'\1', result)
-    result = re.sub(r'([.,;:!?])\s*\1+', r'\1', result)
+    result = re.sub(r'([,;:!?])\s*\1+', r'\1', result)
+    result = re.sub(r'\.\s+\.', '.', result)
+    result = re.sub(r'\.{4,}', '...', result)
+    result = re.sub(r'(?<!\.)\.{2}(?!\.)', '.', result)
     result = re.sub(r'\(\s*\)', '', result)
     result = re.sub(r'\[\s*\]', '', result)
-    
-    # 12. Nettoyer les espaces avant ponctuation
+
+    # 15. Nettoyer les espaces avant ponctuation
     result = re.sub(r'\s+\.', '.', result)
     result = re.sub(r'\s+,', ',', result)
-    
+
     return result.strip()
+
+
+def normalize_for_tts(text: str) -> str:
+    """
+    Normalisations orthophoniques spécifiques pour fr-FR-VivienneNeural.
+    """
+    t = text
+    t = re.sub(r'\b49\.3\b', '49 3', t)
+    t = re.sub(r'\bn°\s*(\d+)', r'numéro \1', t, flags=re.IGNORECASE)
+    t = re.sub(r'\bCO\s+2\b', 'CO2', t)
+    t = re.sub(r'\bO\s+2\b', 'O2', t)
+    t = re.sub(r'\bH\s+2\s*O\b', 'H2O', t)
+    t = re.sub(r'\b(\d+)\s+°', r'\1°', t)
+    t = re.sub(r'\bet/ou\b', 'et ou', t, flags=re.IGNORECASE)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
+def prepare_text_for_tts(text: str) -> str:
+    """
+    Pipeline complet et unifié de préparation du texte avant envoi au TTS.
+    """
+    t = re.sub(r'\s+', ' ', text).strip()
+    t = clean_text_for_tts(t)
+    t = convertir_chiffres_romains(t)
+    t = process_inclusive_writing(t)
+    t = normalize_for_tts(t)
+    return t
+
 
 def preprocess_for_api(text: str) -> str:
     """
@@ -261,10 +563,10 @@ def preprocess_for_api(text: str) -> str:
     """
     t = text
 
-    # 1. Supprimer les guillemets typographiques de section ("Titre..." .. "Sous-titre...") 
+    # 1. Supprimer les guillemets typographiques de section ("Titre..." .. "Sous-titre...")
     t = re.sub(r'^(?:\s*"[^"]{0,300}"\s*\.{0,3}\s*)+', '', t, flags=re.DOTALL)
 
-    # 2. Couper au premier marqueur de section-parasites (mutualisé avec TTS mais peut être plus permissif)
+    # 2. Couper au premier marqueur de section-parasites
     noise_markers = [
         r'"Et vous\s*\?"',
         r'"Voir aussi"',
@@ -301,6 +603,7 @@ def preprocess_for_api(text: str) -> str:
         f"({100 * len(t) // len(text)}% conservé)"
     )
     return t
+
 
 def strip_markdown_for_tts(text: str) -> str:
     """

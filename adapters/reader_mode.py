@@ -61,15 +61,18 @@ def reader_extract_content(html_string):
             # Remove list item markers but keep the content and add a pause
             line = re.sub(r'^[-*+]\s+', '', line)
             
-            # Replace markdown emphasis (bold/italic) with quotes for TTS intonation/pauses
-            line = re.sub(r'\*\*(.*?)\*\*', r'"\1"', line)
-            line = re.sub(r'\*(.*?)\*', r'"\1"', line)
-            line = re.sub(r'__(.*?)__', r'"\1"', line)
-            line = re.sub(r'_(.*?)_', r'"\1"', line)
-            
+            # Remove markdown emphasis (bold/italic) cleanly without injecting quotes
+            line = re.sub(r'\*\*(.*?)\*\*', r'\1', line)
+            line = re.sub(r'\*(.*?)\*', r'\1', line)
+            line = re.sub(r'__(.*?)__', r'\1', line)
+            line = re.sub(r'_(.*?)_', r'\1', line)
+
             # Clean up any remaining stray asterisks or underscores
-            line = line.replace('*', ', ')
-            line = line.replace('_', ' ')
+            line = re.sub(r'(?<=\S)\*', '', line)
+            line = line.replace('*', ' ')
+            line = line.replace('_', ' ').strip()
+            if not line:
+                continue
             
             # Add punctuation if missing for TTS pauses
             if not line[-1] in '.!?:;,"\'»*':

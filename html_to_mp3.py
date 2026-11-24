@@ -16,7 +16,7 @@ from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, COMM, USLT, TDRC, APIC
 import urllib.request
 import urllib.error
 from summarizer import get_summarizer, SummarizationError
-from text_utils import process_inclusive_writing, convertir_chiffres_romains, clean_text_for_tts, strip_markdown_for_tts
+from text_utils import prepare_text_for_tts, strip_markdown_for_tts
 
 import sys
 
@@ -368,11 +368,7 @@ def process_html_file_test(filepath, test_output_dir):
             f"Par {author}... "
         )
 
-        full_content = f"{text_intro}{text_body}"
-        full_content = re.sub(r'\s+', ' ', full_content).strip()
-        full_content = process_inclusive_writing(full_content)  # Handle écriture inclusive
-        full_content = convertir_chiffres_romains(full_content)  # Convert Roman numerals
-        full_content = clean_text_for_tts(full_content)  # Remove URLs, notes, references
+        full_content = prepare_text_for_tts(f"{text_intro}{text_body}")
 
         # Save text content to file
         with open(txt_path, 'w', encoding='utf-8') as f:
@@ -485,11 +481,7 @@ async def generate_audio_from_content(meta, text_body, mp3_path, voice=VOICE):
         f"Par {author}... "
     )
 
-    full_content = f"{text_intro}{text_body}"
-    full_content = re.sub(r'\s+', ' ', full_content).strip()
-    full_content = process_inclusive_writing(full_content)  # Handle écriture inclusive
-    full_content = convertir_chiffres_romains(full_content)  # Convert Roman numerals
-    full_content = clean_text_for_tts(full_content)  # Remove URLs, notes, references
+    full_content = prepare_text_for_tts(f"{text_intro}{text_body}")
 
     if len(full_content) < 50:
         logger.warning(f"Skipping generation for '{title}': content too short or empty.")
@@ -704,7 +696,7 @@ async def flush_grouped_summaries() -> None:
             )
 
             combined_text = _build_grouped_text(media, date_bucket, entries)
-            combined_text = clean_text_for_tts(combined_text)
+            combined_text = prepare_text_for_tts(combined_text)
 
             if len(combined_text) < 20:
                 logger.warning(f"Texte groupé trop court pour {mp3_name}, ignoré.")
