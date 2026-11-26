@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 
 import requests
@@ -25,6 +26,11 @@ GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model
 
 # Longueur maximale du texte envoyé à l'API (en caractères) pour éviter de dépasser les quotas de tokens
 MAX_TEXT_LENGTH = 8000
+
+# Quota par défaut de tokens par minute (marge de sécurité sous les 16K TPM de Gemma)
+DEFAULT_MAX_TPM = 14000
+TPM_WINDOW_SECONDS = 60.0
+OUTPUT_TOKEN_RESERVE = 600
 
 # Délai d'attente réseau par défaut pour l'API Gemini (secondes)
 DEFAULT_TIMEOUT_SECONDS = 180
@@ -98,6 +104,14 @@ def load_gemini_config(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
         )
     config["timeout"] = int(raw_timeout)
 
+    # Quota optionnel de tokens par minute (défaut : DEFAULT_MAX_TPM)
+    raw_tpm = config.get("max_tokens_per_minute", DEFAULT_MAX_TPM)
+    if not isinstance(raw_tpm, (int, float)) or raw_tpm <= 0:
+        raise ValueError(
+            f"max_tokens_per_minute doit être un nombre positif (reçu : {raw_tpm})"
+        )
+    config["max_tokens_per_minute"] = int(raw_tpm)
+
     return config
 
 
@@ -119,12 +133,15 @@ class GeminiSummarizer:
         self._config = load_gemini_config(config_path)
         self._last_request_time: float = 0.0
         self._lock = asyncio.Lock()
+        self._state_lock = threading.Lock()
+        self._token_history: list[list] = []
 
         self._api_key: str = self._config["api_key"]
         self._model: str = self._config["model"]
         self._prompt_template: str = self._config["prompt"]
         self._max_rpm: int = int(self._config["max_requests_per_minute"])
         self._min_interval: float = 60.0 / self._max_rpm
+        self._max_tpm: int = int(self._config.get("max_tokens_per_minute", DEFAULT_MAX_TPM))
         self._timeout: int = self._config.get("timeout", DEFAULT_TIMEOUT_SECONDS)
         self._concurrency: int = self._config.get("concurrency", 6)
         self._semaphore = asyncio.Semaphore(self._concurrency)
@@ -133,19 +150,66 @@ class GeminiSummarizer:
             f"GeminiSummarizer initialisé — modèle : {self._model}, "
             f"timeout : {self._timeout}s, "
             f"concurrence : {self._concurrency}, "
-            f"limite : {self._max_rpm} req/min (intervalle min : {self._min_interval:.1f}s)"
+            f"limite : {self._max_rpm} req/min (intervalle min : {self._min_interval:.1f}s), "
+            f"TPM max : {self._max_tpm} tok/min"
         )
 
-    async def _enforce_rate_limit(self) -> None:
-        """Attend si nécessaire pour respecter la limite de requêtes par minute."""
+    def _estimate_tokens(self, prompt: str) -> int:
+        """Estime le nombre total de tokens (entrée + marge sortie/thinking)."""
+        return max(1, (len(prompt) + 2) // 3 + OUTPUT_TOKEN_RESERVE)
+
+    def _prune_token_history_locked(self, now: float) -> None:
+        """Supprime les entrées hors de la fenêtre glissante de 60s (sous _state_lock)."""
+        cutoff = now - TPM_WINDOW_SECONDS
+        self._token_history = [entry for entry in self._token_history if entry[0] > cutoff]
+
+    def _compute_tpm_wait_locked(self, now: float, estimated_tokens: int) -> float:
+        """Calcule le délai d'attente (s) pour respecter max_tokens_per_minute (sous _state_lock)."""
+        if estimated_tokens <= 0 or not self._token_history:
+            return 0.0
+        self._prune_token_history_locked(now)
+        needed = min(estimated_tokens, self._max_tpm)
+        used = sum(entry[1] for entry in self._token_history)
+        if used + needed <= self._max_tpm:
+            return 0.0
+        for ts, tokens in self._token_history:
+            used -= tokens
+            if used + needed <= self._max_tpm:
+                return max(0.0, TPM_WINDOW_SECONDS - (now - ts) + 0.05)
+        return max(0.0, TPM_WINDOW_SECONDS - (now - self._token_history[-1][0]) + 0.05)
+
+    async def _enforce_rate_limit(self, estimated_tokens: int = 0) -> list | None:
+        """Attend si nécessaire pour respecter les limites RPM et TPM."""
         async with self._lock:
-            now = time.monotonic()
-            elapsed = now - self._last_request_time
-            if elapsed < self._min_interval:
-                wait = self._min_interval - elapsed
-                logger.debug(f"Rate limiting : attente de {wait:.2f}s avant appel Gemini")
+            with self._state_lock:
+                now = time.monotonic()
+                rpm_wait = 0.0
+                if self._last_request_time > 0:
+                    elapsed = now - self._last_request_time
+                    if elapsed < self._min_interval:
+                        rpm_wait = self._min_interval - elapsed
+                tpm_wait = self._compute_tpm_wait_locked(now, estimated_tokens)
+                wait = max(rpm_wait, tpm_wait)
+
+            if wait > 0:
+                if tpm_wait > 2.0:
+                    logger.info(
+                        f"⏳ Rate limiting TPM : attente de {wait:.1f}s "
+                        f"(quota {self._max_tpm} tok/min)…"
+                    )
+                else:
+                    logger.debug(f"Rate limiting : attente de {wait:.2f}s avant appel Gemini")
                 await asyncio.sleep(wait)
-            self._last_request_time = time.monotonic()
+
+            with self._state_lock:
+                now = time.monotonic()
+                self._last_request_time = now
+                self._prune_token_history_locked(now)
+                if estimated_tokens > 0:
+                    entry = [now, estimated_tokens]
+                    self._token_history.append(entry)
+                    return entry
+                return None
 
     def _extract_core_response(self, text: str) -> str:
         """
@@ -204,7 +268,13 @@ class GeminiSummarizer:
             )
         return self._prompt_template.replace("{text}", truncated)
 
-    def _call_api_sync(self, prompt: str, label: str = "") -> str:
+    def _call_api_sync(
+        self,
+        prompt: str,
+        label: str = "",
+        token_entry: list | None = None,
+        estimated_tokens: int = 0,
+    ) -> str:
         """
         Appel synchrone à l'API REST Gemini avec retry sur erreurs transitoires.
         Retourne le texte résumé ou lève une exception en cas d'échec définitif.
@@ -231,6 +301,20 @@ class GeminiSummarizer:
 
         last_exc: Exception = RuntimeError("Aucune tentative effectuée")
         for attempt in range(1, MAX_RETRIES + 1):
+            if attempt > 1 and estimated_tokens > 0:
+                with self._state_lock:
+                    tpm_wait = self._compute_tpm_wait_locked(_time.monotonic(), estimated_tokens)
+                if tpm_wait > 0:
+                    logger.info(
+                        f"⏳ Rate limiting TPM avant retry{tag} : attente de {tpm_wait:.1f}s…"
+                    )
+                    _time.sleep(tpm_wait)
+                with self._state_lock:
+                    now = _time.monotonic()
+                    self._prune_token_history_locked(now)
+                    token_entry = [now, estimated_tokens]
+                    self._token_history.append(token_entry)
+
             try:
                 response = requests.post(url, params=params, json=body, timeout=self._timeout)
             except Exception as e:
@@ -271,7 +355,11 @@ class GeminiSummarizer:
                     chunks = [chunks]  # fallback si l'API renvoie un objet unique
 
                 answer_parts = []
+                actual_tokens = None
                 for chunk in chunks:
+                    usage = chunk.get("usageMetadata")
+                    if isinstance(usage, dict) and "totalTokenCount" in usage:
+                        actual_tokens = int(usage["totalTokenCount"])
                     candidates = chunk.get("candidates", [])
                     if not candidates:
                         continue
@@ -279,6 +367,10 @@ class GeminiSummarizer:
                     for p in parts:
                         if not p.get("thought", False) and "text" in p:
                             answer_parts.append(p["text"])
+
+                if actual_tokens is not None and token_entry is not None:
+                    with self._state_lock:
+                        token_entry[1] = actual_tokens
 
                 if not answer_parts:
                     raise ValueError("Aucune part de réponse non-thinking trouvée")
@@ -319,15 +411,23 @@ class GeminiSummarizer:
 
         tag = f" {label}" if label else ""
         async with self._semaphore:
-            await self._enforce_rate_limit()
-
             prompt = self._build_prompt(text)
+            estimated_tokens = self._estimate_tokens(prompt)
+            token_entry = await self._enforce_rate_limit(estimated_tokens)
             start_t = time.monotonic()
 
             try:
                 loop = asyncio.get_event_loop()
                 try:
-                    summary = await loop.run_in_executor(None, lambda: self._call_api_sync(prompt, label=label))
+                    summary = await loop.run_in_executor(
+                        None,
+                        lambda: self._call_api_sync(
+                            prompt,
+                            label=label,
+                            token_entry=token_entry,
+                            estimated_tokens=estimated_tokens,
+                        ),
+                    )
                 except TypeError:
                     summary = await loop.run_in_executor(None, lambda: self._call_api_sync(prompt))
 

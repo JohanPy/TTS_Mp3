@@ -162,6 +162,29 @@ class TestLoadConfig(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_load_default_tpm(self):
+        """Si max_tokens_per_minute n'est pas spécifié, la valeur par défaut est 14000."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(VALID_CONFIG, f)
+            path = f.name
+        try:
+            config = load_gemini_config(path)
+            self.assertEqual(config["max_tokens_per_minute"], 14000)
+        finally:
+            os.unlink(path)
+
+    def test_load_invalid_tpm(self):
+        """Lève ValueError si max_tokens_per_minute <= 0."""
+        bad_config = {**VALID_CONFIG, "max_tokens_per_minute": 0}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(bad_config, f)
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                load_gemini_config(path)
+        finally:
+            os.unlink(path)
+
 
 class TestRateLimiting(unittest.TestCase):
     """Tests du rate limiter."""
@@ -218,6 +241,51 @@ class TestRateLimiting(unittest.TestCase):
         """L'intervalle minimum est bien 60 / max_rpm."""
         s = self._make_summarizer(rpm=10)
         self.assertAlmostEqual(s._min_interval, 6.0, places=5)
+
+    def test_tpm_limit_triggers_sleep_when_quota_full(self):
+        """Quand la fenêtre TPM est saturée, _enforce_rate_limit attend l'expiration."""
+        config = {**VALID_CONFIG, "max_requests_per_minute": 60, "max_tokens_per_minute": 5000}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(config, f)
+            path = f.name
+        try:
+            s = GeminiSummarizer(path)
+            sleep_calls = []
+
+            async def fake_sleep(duration):
+                sleep_calls.append(duration)
+
+            async def run():
+                now = time.monotonic()
+                s._last_request_time = now - 2.0  # intervalle RPM (1s) déjà passé
+                s._token_history = [[now - 10.0, 4000]]
+                with patch("asyncio.sleep", side_effect=fake_sleep):
+                    await s._enforce_rate_limit(estimated_tokens=2000)
+
+            _run(run())
+            self.assertEqual(len(sleep_calls), 1)
+            self.assertGreater(sleep_calls[0], 45.0)
+            self.assertLessEqual(sleep_calls[0], 60.1)
+        finally:
+            os.unlink(path)
+
+    def test_usage_metadata_updates_token_history(self):
+        """usageMetadata.totalTokenCount met à jour le nombre de tokens enregistré."""
+        s = self._make_summarizer(rpm=60)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [
+            {
+                "candidates": [{"content": {"parts": [{"text": "Résumé court."}]}}],
+                "usageMetadata": {"totalTokenCount": 1234},
+            }
+        ]
+        article = "Ceci est un article de test suffisamment long pour déclencher le résumé IA."
+        with patch("requests.post", return_value=mock_resp):
+            _run(s.summarize(article))
+
+        self.assertEqual(len(s._token_history), 1)
+        self.assertEqual(s._token_history[0][1], 1234)
 
 
 class TestSummarizeSuccess(unittest.TestCase):
