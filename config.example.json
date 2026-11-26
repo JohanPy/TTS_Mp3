@@ -7,14 +7,21 @@
         "summary": "Resumes"
     },
     "archive_dir": "~/Téléchargements/versaudio/Archived",
-    "voice": "fr-FR-VivienneNeural",
+    "voice": "fr-FR-VivienneMultilingualNeural",
+    "secondary_voice": "fr-FR-RemyMultilingualNeural",
+    "audio_mode": "rich",
+    "earcons": true,
+    "loudnorm": true,
+    "inter_paragraph_pause_ms": 450,
+    "long_quote_min_chars": 180,
+    "max_tts_calls_per_article": 60,
     "concurrency_limit": 3,
     "rss_feeds": [
         "https://www.acrimed.org/spip.php?page=backend",
         "https://www.unioncommunistelibertaire.org/spip.php?page=backend&",
         {
             "url": "http://www.developpez.com/index/rss",
-            "voice": "fr-FR-VivienneNeural",
+            "voice": "fr-FR-VivienneMultilingualNeural",
             "summarize": true,
             "group_window_hours": 24
         }

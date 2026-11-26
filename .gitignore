@@ -44,6 +44,7 @@ debug_output.txt
 # Fichiers de configuration locaux (contiennent des secrets ou des chemins personnels)
 config.json
 gemini_config.json
+pronunciation_dict.json
 
 # Fichiers d'état (générés à l'exécution, propres à chaque machine)
 processed_urls.json

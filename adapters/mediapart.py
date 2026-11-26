@@ -1,6 +1,7 @@
 
 from .base import BaseAdapter
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
+from segments import Segment, segments_to_plain_text
 import re
 import os
 
@@ -84,77 +85,158 @@ class MediapartAdapter(BaseAdapter):
 
         return meta
         
-    def _extract_content(self):
+    def _extract_segments(self) -> list[Segment]:
+        segments: list[Segment] = []
+
+        # 1. Chapô Mediapart (situé hors de news__rich-text-content)
+        chapo_el = self.soup.select_one(
+            ".news__heading__top__intro, .content-page__intro, .news__intro"
+        )
+        if chapo_el:
+            chapo_text = re.sub(r'\s+([.,;:!?])', r'\1', chapo_el.get_text(separator=" ", strip=True))
+            if chapo_text and len(chapo_text) >= 25:
+                segments.append(Segment("chapo", chapo_text))
+
         raw_main = self.soup.select_one("div.news__rich-text-content, div.content-page__full")
-        
         if not raw_main:
-            return ""
+            return segments
 
         main_content = BeautifulSoup(str(raw_main), 'html.parser')
 
-        # Handle dropcaps: they have a visual part (aria-hidden) and a reader part (screen-reader-only)
-        # We want to keep the reader part and remove the visual part to avoid fragmented reading.
+        # Handle dropcaps: keep reader part, remove visual part
         for dropcap_wrapper in main_content.select(".dropcap-wrapper"):
-            # Remove the visual part
             visual_part = dropcap_wrapper.select_one('[aria-hidden="true"]')
             if visual_part:
                 visual_part.extract()
-            # The screen-reader-only part contains the full word, we want to keep it.
-            # We unwrap it so it becomes plain text and won't be removed by the next step.
             reader_part = dropcap_wrapper.select_one(".screen-reader-only")
             if reader_part:
                 reader_part.unwrap()
 
-        # Remove "À lire aussi" blocks, accessibility hidden text, pull-quotes (highlight), footnotes and newsletter asides
-        # Note: Do NOT remove dropcap-wrapper as it contains the first paragraph text
-        for node in main_content.select(".lire-aussi, .r-interne, .read-also, .screen-reader-only, figure, aside.highlight, span.spip_note_ref, a.spip_note, sup.footnote"):
+        # Remove "À lire aussi" blocks, accessibility hidden text, pull-quotes (highlight), footnotes and newsletter inserts
+        for node in main_content.select(
+            ".lire-aussi, .r-interne, .read-also, .screen-reader-only, .newsletter-insert, "
+            "figure, aside.highlight, span.spip_note_ref, a.spip_note, sup.footnote"
+        ):
             node.extract()
 
         for aside in main_content.find_all("aside"):
             aside_classes = aside.get("class") or []
-            aside_text = aside.get_text(" ", strip=True)
-            if "highlight" in aside_classes or not aside_classes or re.search(r'inscrivez-vous|newsletter', aside_text, re.IGNORECASE):
-                aside.extract()
-            
-        # Identify paragraphs and headings
-        # Handling nested paragraphs: Mediapart HTML can be very messy with <p> inside <p>.
-        # Strategy: Find all interesting tags, then filter out those that are descendants of another interesting tag.
-        # This keeps the outermost container and avoids duplication.
-        
-        all_tags = main_content.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li'])
-        top_level_tags = []
-        all_tags_set = set(all_tags)
-        
-        for tag in all_tags:
-            is_nested = False
-            for parent in tag.parents:
-                if parent == main_content: break # Don't go beyond main container
-                if parent in all_tags_set:
-                    is_nested = True
-                    break
-            if not is_nested:
-                top_level_tags.append(tag)
-        
-        text_parts = []
-        
-        for tag in top_level_tags:
-            text = re.sub(r'\s+([.,;:!?])', r'\1', tag.get_text(separator=" ", strip=True))
-             
-            if "À lire aussi" in text and len(text) < 50:
+            if "box" in aside_classes:
                 continue
-                
-            if not text: continue
-            
-            if not text[-1] in '.!?:;…':
-                text = text + '.'
+            aside_text = aside.get_text(" ", strip=True)
+            if "highlight" in aside_classes or not aside_classes or re.search(r'inscrivez-vous|newsletter|lettre enquête', aside_text, re.IGNORECASE):
+                aside.extract()
 
-            if tag.name.startswith('h'):
-                text_parts.append(text if text[-1] in '?!' else (f"{text}..." if not text.endswith('...') else text))
-            elif tag.name == 'li':
-                text_parts.append(text if text[-1] in '.!?;:' else f"{text},")
-            else:
-                text_parts.append(text)
-                
-        return " ".join(text_parts)
+        # Supprimer les paragraphes newsletter feuille insérés hors <aside>
+        for p in main_content.find_all("p"):
+            if p.find(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div', 'aside', 'blockquote']):
+                continue
+            p_txt = p.get_text(" ", strip=True)
+            if len(p_txt) < 350 and re.search(
+                r'Voulez-vous plonger dans les\s+secrets de\s+fabrication|Rejoignez la\s+[«"].*?lettre enquête',
+                p_txt,
+                re.IGNORECASE,
+            ):
+                p.extract()
+
+        block_names = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'blockquote', 'ul', 'ol', 'div', 'aside', 'section'}
+
+        def _clean_inline_text(raw: str) -> str:
+            t = re.sub(r'\s+', ' ', raw).strip()
+            return re.sub(r'\s+([.,;:!?])', r'\1', t)
+
+        def _is_box_tag(tag: Tag) -> bool:
+            return 'box' in (tag.get('class') or [])
+
+        def _emit_paragraph(text: str, tag: Tag | None, para_kind: str) -> None:
+            cleaned = _clean_inline_text(text)
+            if not cleaned:
+                return
+            if "À lire aussi" in cleaned and len(cleaned) < 50:
+                return
+            is_bq = (para_kind == "paragraph" and tag is not None and self._is_bold_question_tag(tag, cleaned))
+            segments.append(Segment(para_kind, cleaned, is_bold_question=is_bq))
+
+        def _walk_node(node: Tag, para_kind: str = "paragraph") -> None:
+            if not isinstance(node, Tag):
+                return
+
+            if _is_box_tag(node):
+                header = node.select_one('.box__header')
+                if header:
+                    h_txt = _clean_inline_text(header.get_text(separator=" ", strip=True))
+                    if h_txt:
+                        segments.append(Segment("box_title", h_txt))
+                content_box = node.select_one('.box__content') or node
+                for child in content_box.children:
+                    if isinstance(child, Tag) and child is not header:
+                        _walk_node(child, para_kind="box_body")
+                return
+
+            name = node.name or ""
+            if name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+                txt = _clean_inline_text(node.get_text(separator=" ", strip=True))
+                if txt:
+                    segments.append(Segment("heading", txt))
+                return
+
+            if name == 'blockquote':
+                txt = _clean_inline_text(node.get_text(separator=" ", strip=True))
+                if txt:
+                    segments.append(Segment("quote_block", txt))
+                return
+
+            if name == 'li':
+                txt = _clean_inline_text(node.get_text(separator=" ", strip=True))
+                if txt:
+                    segments.append(Segment("list_item" if para_kind == "paragraph" else para_kind, txt))
+                return
+
+            if name == 'p':
+                has_nested_block = node.find(
+                    lambda t: isinstance(t, Tag) and (
+                        t.name in ('p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'ul', 'ol', 'li')
+                        or _is_box_tag(t)
+                    )
+                )
+                if not has_nested_block:
+                    _emit_paragraph(node.get_text(separator=" ", strip=True), node, para_kind)
+                    return
+
+                # <p> contenant des blocs imbriqués : flusher les inline par morceaux entre blocs
+                buf: list[str] = []
+
+                def _flush_buf() -> None:
+                    if not buf:
+                        return
+                    joined = _clean_inline_text(" ".join(buf))
+                    buf.clear()
+                    if joined:
+                        _emit_paragraph(joined, None, para_kind)
+
+                for child in node.children:
+                    if isinstance(child, NavigableString):
+                        if str(child).strip():
+                            buf.append(str(child).strip())
+                    elif isinstance(child, Tag):
+                        if child.name in block_names or _is_box_tag(child):
+                            _flush_buf()
+                            _walk_node(child, para_kind=para_kind)
+                        else:
+                            t_inline = child.get_text(separator=" ", strip=True)
+                            if t_inline:
+                                buf.append(t_inline)
+                _flush_buf()
+                return
+
+            for child in node.children:
+                if isinstance(child, Tag):
+                    _walk_node(child, para_kind=para_kind)
+
+        _walk_node(main_content)
+        return segments
+
+    def _extract_content(self):
+        return segments_to_plain_text(self._extract_segments())
 
 

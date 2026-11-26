@@ -12,9 +12,12 @@ from adapters.mediapart import MediapartAdapter
 from adapters.reader_mode import reader_extract_content
 from adapters.ucl import UCLAdapter
 from text_utils import (
+    apply_pronunciation_dict,
     build_article_intro,
     clean_text_for_tts,
     convertir_chiffres_romains,
+    format_list_item_for_tts,
+    normalize_all_caps,
     normalize_for_tts,
     prepare_text_for_tts,
     process_inclusive_writing,
@@ -258,6 +261,43 @@ class TestCleanAndNormalizeTTS(unittest.TestCase):
         non_dup = "La crise sociale s'aggrave dans le pays depuis plusieurs mois déjà."
         self.assertEqual(strip_leading_duplicate_title("La crise sociale", non_dup), non_dup)
 
+    def test_normalize_all_caps_preserves_acronyms(self):
+        raw = "[ALLIER] CONTRE LA GUEULETONNADE DES CHEMISES BRUNES : PAS DE FASCISTES DANS NOS CAMPAGNES !"
+        norm = normalize_all_caps(raw)
+        self.assertIn("Contre la gueuletonnade des chemises brunes : Pas de fascistes dans nos campagnes !", norm)
+        # Les sigles isolés et listes de sigles restent intacts
+        sigles = "Selon LFI, RN, PS et UE sur TF1 avec CO2 et PFAS."
+        self.assertEqual(normalize_all_caps(sigles), sigles)
+        # Même à l'intérieur d'un titre en majuscules, les sigles connus restent en majuscules
+        mixed = "CONTRE LA POLITIQUE DE LFI ET DU RN EN FRANCE"
+        self.assertIn("LFI", normalize_all_caps(mixed))
+        self.assertIn("RN", normalize_all_caps(mixed))
+
+    def test_visual_cross_refs_mediapart_newsletter_and_pronunciation_dict(self):
+        raw = (
+            "Voulez-vous plonger dans les secrets de fabrication de nos révélations ? "
+            "Rejoignez la « lettre enquête » pour découvrir nos coulisses. "
+            "Un fait central (lire l’intégralité de la réponse en annexes) et un autre (voir ci-dessous). "
+            "Le graphique (ci-contre) montre l'évolution."
+        )
+        cleaned = clean_text_for_tts(raw)
+        self.assertNotIn("secrets de fabrication", cleaned)
+        self.assertNotIn("lettre enquête", cleaned)
+        self.assertNotIn("en annexes", cleaned)
+        self.assertNotIn("ci-dessous", cleaned)
+        self.assertNotIn("ci-contre", cleaned)
+        self.assertIn("Un fait central et un autre.", cleaned)
+
+        spoken = apply_pronunciation_dict("Les PFAS sur BFMTV.", {"PFAS": "péfasse", "BFMTV": "B F M T V"})
+        self.assertEqual(spoken, "Les péfasse sur B F M T V.")
+
+    def test_format_list_item_punctuation(self):
+        self.assertEqual(format_list_item_for_tts("Un point court"), "Un point court,")
+        long_item = "Un élément de liste très développé qui contient beaucoup plus de quatre-vingts caractères pour tester le point final"
+        self.assertTrue(format_list_item_for_tts(long_item).endswith("."))
+        multi_sentence = "Première phrase. Deuxième phrase"
+        self.assertTrue(format_list_item_for_tts(multi_sentence).endswith("."))
+
 
 class TestAdaptersCleanup(unittest.TestCase):
     def test_mediapart_removes_aside_newsletter_and_highlight(self):
@@ -277,6 +317,29 @@ class TestAdaptersCleanup(unittest.TestCase):
         self.assertEqual(content.count("Premier paragraphe"), 1)
         self.assertNotIn("Inscrivez-vous", content)
         self.assertIn("Deuxième paragraphe", content)
+
+    def test_mediapart_extracts_chapo_and_box_segments(self):
+        html = """
+        <html><body>
+        <div class="news__heading__top__intro">Voici le chapô exclusif de l'article Mediapart.</div>
+        <div class="news__rich-text-content">
+            <p>Voulez-vous plonger dans les secrets de fabrication de nos révélations ?</p>
+            <p>Premier paragraphe du corps principal.</p>
+            <h2 class="subheading">Première partie</h2>
+            <div class="box">
+                <div class="box__header">Le pouvoir d’achat</div>
+                <div class="box__content"><p>Contenu de l'encadré explicatif.</p></div>
+            </div>
+            <p>Deuxième paragraphe après l'encadré.</p>
+        </div>
+        </body></html>
+        """
+        adapter = MediapartAdapter(BeautifulSoup(html, "html.parser"), "mediapart.html")
+        segs = adapter.get_segments()
+        kinds = [s.kind for s in segs]
+        self.assertEqual(kinds, ["chapo", "paragraph", "heading", "box_title", "box_body", "paragraph"])
+        self.assertIn("chapô exclusif", segs[0].text)
+        self.assertFalse(any("secrets de fabrication" in s.text for s in segs))
 
     def test_arretsurimages_extracts_author_from_equipe_or_title(self):
         html_equipe = """
@@ -334,6 +397,27 @@ class TestAdaptersCleanup(unittest.TestCase):
         self.assertNotIn("557", content)
         self.assertNotIn("vues", content)
         self.assertIn("Premier vrai paragraphe", content)
+
+    def test_mediapart_nested_p_aside_box_and_newsletter_insert(self):
+        html = """
+        <html><body>
+        <div class="news__rich-text-content">
+            <div class="newsletter-insert _compact"><p>Rejoignez la « lettre enquête » chaque samedi.</p></div>
+            <p class="dropcap-wrapper">Texte un complet.<p>Texte deux complet.<aside class="box _set"><div class="box__header">Encadré titre</div><div class="box__content"><p>Contenu encadré.</p></div></aside><p>Texte trois complet.</p></p></p>
+        </div>
+        </body></html>
+        """
+        adapter = MediapartAdapter(BeautifulSoup(html, "html.parser"), "mediapart.html")
+        segs = adapter.get_segments()
+        kinds_texts = [(s.kind, s.text) for s in segs]
+        self.assertNotIn("lettre enquête", " ".join(s.text for s in segs))
+        self.assertEqual(kinds_texts, [
+            ("paragraph", "Texte un complet."),
+            ("paragraph", "Texte deux complet."),
+            ("box_title", "Encadré titre"),
+            ("box_body", "Contenu encadré."),
+            ("paragraph", "Texte trois complet."),
+        ])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 
 from .base import BaseAdapter
 from bs4 import Tag
+from segments import Segment, segments_to_plain_text
 import re
 import os
 
@@ -131,34 +132,23 @@ class ManifestoAdapter(BaseAdapter):
 
         return meta
         
-    def _extract_content(self):
+    def _extract_segments(self) -> list[Segment]:
         soup = self.soup
-        
-        # Manifesto XXI uses Elementor - look for text widgets
-        article = soup.find('article')
+        article = soup.find('article') or soup.find('main') or soup.body
         if not article:
-            main = soup.find('main')
-            article = main if main else soup.body
-        
-        if not article:
-            return ""
-        
-        # Create a copy to avoid modifying original
+            return []
+
         container = article.__copy__()
-        
-        # Remove unwanted elements
-        for element in container(["script", "style", "nav", "header", "footer", 
-                                   "aside", "form", "iframe", "noscript", "figure", 
+        for element in container(["script", "style", "nav", "header", "footer",
+                                   "aside", "form", "iframe", "noscript", "figure",
                                    "button", "input", "img", "video", "audio"]):
             element.extract()
 
-        # Remove specific junk selectors - Elementor specific
         junk_selectors = [
             ".share", ".social", ".sharing",
             ".author", ".post-author", ".elementor-author-box",
             ".tags", ".post-tags",
-            ".comments",
-            ".related", ".jet-smart-listing",
+            ".comments", ".related", ".jet-smart-listing",
             ".navigation", ".nav-links",
             ".meta", ".post-meta", ".elementor-post-info",
             ".elementor-widget-jet-woo-builder-archive-sale-badge",
@@ -172,63 +162,28 @@ class ManifestoAdapter(BaseAdapter):
             for element in container.select(selector):
                 element.extract()
 
-        # Remove standalone date/author paragraphs (very short paragraphs at the start)
         paragraphs = container.find_all('p')
-        for p in paragraphs[:5]:  # Only check first 5
+        for p in paragraphs[:5]:
             text = p.get_text(strip=True)
-            # Skip short metadata-like paragraphs
             if len(text) < 30:
-                # Check if it looks like a date or author name
-                if re.match(r'^\d{1,2}\s+\w+\s+\d{4}$', text):  # Date pattern
+                if re.match(r'^\d{1,2}\s+\w+\s+\d{4}$', text):
                     p.extract()
-                elif len(text.split()) <= 3:  # Short name
+                elif len(text.split()) <= 3:
                     p.extract()
-        
-        # Pre-process: unwrap nested elements
+
         while True:
-            wrapper = container.find(lambda t: t.name in ['p', 'div'] and 
+            wrapper = container.find(lambda t: t.name in ['p', 'div'] and
                                      t.find(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']))
             if not wrapper:
                 break
             wrapper.unwrap()
-            
-        # Extract text from relevant tags
-        text_parts = []
-        seen_texts = set()  # Avoid duplicates
-        
-        for tag in container.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'blockquote', 'li']):
-            text = tag.get_text(separator=" ", strip=True)
-            if not text:
-                continue
-            
-            # Skip very short text
-            if len(text) < 15:
-                continue
-            if re.match(r'^(?:Ne manquez plus notre Newsletter|Articles en lien|Image à la Une\s*:)', text, re.IGNORECASE):
-                continue
 
-            # Skip duplicates
-            text_hash = text[:50]
-            if text_hash in seen_texts:
-                continue
-            seen_texts.add(text_hash)
+        return self._extract_segments_from_container(
+            container,
+            min_len=15,
+            seen_dedup=True,
+            skip_patterns=(r'^(?:Ne manquez plus notre Newsletter|Articles en lien|Image à la Une\s*:)',),
+        )
 
-            if not text[-1] in '.!?:;…':
-                text = text + '.'
-
-            if tag.name.startswith('h'):
-                text_parts.append(f"{text}..." if not text.endswith('...') else text)
-            elif tag.name == 'blockquote':
-                text_parts.append(f"Citation: {text}")
-            elif tag.name == 'li':
-                text_parts.append(f"{text.rstrip('.')},")
-            else:
-                text_parts.append(text)
-
-        result = " ".join(text_parts)
-        # Clean up multiple dots
-        result = re.sub(r'\.{5,}', '...', result)
-        result = re.sub(r'\.{2}', '.', result)
-        result = re.sub(r',\.', '.', result)
-        
-        return result
+    def _extract_content(self):
+        return segments_to_plain_text(self._extract_segments())

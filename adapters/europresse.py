@@ -1,5 +1,6 @@
 
 from .base import BaseAdapter
+from segments import Segment, segments_to_plain_text
 
 class EuropresseAdapter(BaseAdapter):
     def can_handle(self):
@@ -42,30 +43,19 @@ class EuropresseAdapter(BaseAdapter):
             
         return meta
 
-    def _extract_content(self):
-        # Specific selector for Europresse
-        main_content = self.soup.select_one("div.DocText, div.doc-content, section.doc-content")
-        
-        if not main_content:
-            return ""
+    def _extract_segments(self) -> list[Segment]:
+        raw_main = self.soup.select_one("div.DocText, div.doc-content, section.doc-content")
+        if not raw_main:
+            return []
 
-        # Pre-process: unwrap
+        main_content = raw_main.__copy__()
         while True:
             wrapper = main_content.find(lambda t: t.name in ['p', 'div'] and t.find(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']))
-            if not wrapper: break
+            if not wrapper:
+                break
             wrapper.unwrap()
 
-        text_parts = []
-        for tag in main_content.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p']):
-            text = tag.get_text(separator=" ", strip=True)
-            if not text: continue
-            
-            if not text[-1] in '.!?:;…':
-                text = text + '.'
+        return self._extract_segments_from_container(main_content, min_len=1)
 
-            if tag.name.startswith('h'):
-                text_parts.append(f"{text}..." if not text.endswith('...') else text)
-            else:
-                text_parts.append(text)
-                
-        return " ".join(text_parts)
+    def _extract_content(self):
+        return segments_to_plain_text(self._extract_segments())

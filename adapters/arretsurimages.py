@@ -1,4 +1,5 @@
 from .base import BaseAdapter
+from segments import Segment, segments_to_plain_text
 import re
 import os
 
@@ -82,20 +83,15 @@ class ArretSurImagesAdapter(BaseAdapter):
 
         return meta
 
-    def _extract_content(self):
-        """Extract the main article content specifically avoiding comments panel."""
+    def _extract_segments(self) -> list[Segment]:
+        """Extract structured segments specifically avoiding comments panel."""
         soup = self.soup
-        
-        # 1. Target the primary article containers
-        # .article is typically the main article container, .article-body is the inner one
-        article = soup.find('article', class_='article') 
+        article = soup.find('article', class_='article')
         if not article:
             article = soup.find('div', class_='article-body')
-            
         if not article:
-            # Fallback
-            return self._reader_extract()
+            return self._reader_extract_segments()
+        return self._reader_extract_segments(str(article))
 
-        # Use Trafilatura reader extraction on just the specific article container
-        # This gives us pristine results and avoids reader_mode accidentally targeting comments
-        return self._reader_extract(str(article))
+    def _extract_content(self):
+        return segments_to_plain_text(self._extract_segments())

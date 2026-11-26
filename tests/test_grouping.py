@@ -233,7 +233,7 @@ class TestFlushGroupedSummaries(unittest.TestCase):
         mock_communicate.save = AsyncMock()
 
         with patch("edge_tts.Communicate", return_value=mock_communicate) as mock_tts:
-            _run(h2m.flush_grouped_summaries())
+            _run(h2m.flush_grouped_summaries(fast_mode=True))
             mock_tts.assert_called_once()
             mock_communicate.save.assert_awaited_once()
 
@@ -247,7 +247,7 @@ class TestFlushGroupedSummaries(unittest.TestCase):
 
         with patch("edge_tts.Communicate", return_value=mock_communicate):
             with patch("mutagen.id3.ID3"):
-                _run(h2m.flush_grouped_summaries())
+                _run(h2m.flush_grouped_summaries(fast_mode=True))
 
         data = h2m.load_grouped_summaries()
         self.assertEqual(len(data["pending"]), 0)
@@ -263,7 +263,7 @@ class TestFlushGroupedSummaries(unittest.TestCase):
 
         with patch("edge_tts.Communicate", return_value=mock_communicate):
             with patch("mutagen.id3.ID3"):
-                _run(h2m.flush_grouped_summaries())
+                _run(h2m.flush_grouped_summaries(fast_mode=True))
 
         data = h2m.load_grouped_summaries()
         self.assertEqual(len(data["pending"]), 1)
@@ -284,7 +284,7 @@ class TestFlushGroupedSummaries(unittest.TestCase):
 
         with patch("edge_tts.Communicate", return_value=mock_communicate), \
              patch("asyncio.sleep"):
-            _run(h2m.flush_grouped_summaries())
+            _run(h2m.flush_grouped_summaries(fast_mode=True))
 
         data = h2m.load_grouped_summaries()
         self.assertEqual(len(data["pending"]), 1)
@@ -306,7 +306,7 @@ class TestFlushGroupedSummaries(unittest.TestCase):
 
         with patch("edge_tts.Communicate", return_value=mock_communicate):
             with patch("mutagen.id3.ID3"):
-                _run(h2m.flush_grouped_summaries())
+                _run(h2m.flush_grouped_summaries(fast_mode=True))
 
         self.assertEqual(len(saved_paths), 1)
         filename = os.path.basename(saved_paths[0])
@@ -321,7 +321,7 @@ class TestFlushGroupedSummaries(unittest.TestCase):
         """Si le pending est vide, flush ne fait rien et ne crashe pas."""
         self._write_pending([])
         with patch("edge_tts.Communicate") as mock_tts:
-            _run(h2m.flush_grouped_summaries())
+            _run(h2m.flush_grouped_summaries(fast_mode=True))
             mock_tts.assert_not_called()
 
     def test_multiple_feeds_separate_mp3s(self):
@@ -345,9 +345,46 @@ class TestFlushGroupedSummaries(unittest.TestCase):
 
         with patch("edge_tts.Communicate", return_value=mock_communicate):
             with patch("mutagen.id3.ID3"):
-                _run(h2m.flush_grouped_summaries())
+                _run(h2m.flush_grouped_summaries(fast_mode=True))
 
         self.assertEqual(len(saved_paths), 2, "Deux flux → deux MP3 groupés distincts")
+
+    def test_rich_mode_builds_chapters_and_cleans_pending(self):
+        """En mode riche, flush_grouped_summaries appelle build_rich_audio avec les segments groupés."""
+        entry1 = {**SAMPLE_ENTRY, "date_bucket": YESTERDAY, "title": "Actu un"}
+        entry2 = {**SAMPLE_ENTRY, "date_bucket": YESTERDAY, "title": "Actu deux"}
+        self._write_pending([entry1, entry2])
+
+        captured_segments = []
+
+        async def fake_build_rich(segs, mp3_path, cfg, limiter, **kwargs):
+            captured_segments.extend(segs)
+            return [("Introduction", 0, 1000), ("1. Actu un", 1000, 2000), ("2. Actu deux", 2000, 3000)]
+
+        with patch("html_to_mp3.is_ffmpeg_available", return_value=True), \
+             patch("html_to_mp3.build_rich_audio", side_effect=fake_build_rich) as mock_build, \
+             patch("html_to_mp3.ID3"), \
+             patch("html_to_mp3.write_id3_chapters") as mock_chap:
+            _run(h2m.flush_grouped_summaries(fast_mode=False))
+
+        mock_build.assert_awaited_once()
+        mock_chap.assert_called_once()
+        kinds = [s.kind for s in captured_segments]
+        self.assertIn("group_intro", kinds)
+        self.assertEqual(kinds.count("group_item_title"), 2)
+        self.assertEqual(kinds.count("group_item_body"), 2)
+        self.assertEqual(len(h2m.load_grouped_summaries()["pending"]), 0)
+
+    def test_rich_mode_error_keeps_pending(self):
+        """En mode riche, si build_rich_audio échoue, les entrées restent dans pending."""
+        entry = {**SAMPLE_ENTRY, "date_bucket": YESTERDAY}
+        self._write_pending([entry])
+
+        with patch("html_to_mp3.is_ffmpeg_available", return_value=True), \
+             patch("html_to_mp3.build_rich_audio", side_effect=RuntimeError("ffmpeg failure")):
+            _run(h2m.flush_grouped_summaries(fast_mode=False))
+
+        self.assertEqual(len(h2m.load_grouped_summaries()["pending"]), 1)
 
 
 class TestLoadSaveGroupedSummaries(unittest.TestCase):

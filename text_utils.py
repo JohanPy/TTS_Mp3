@@ -1,7 +1,21 @@
-import re
+import json
 import logging
+import os
+import re
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_PRONUNCIATION_DICT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "pronunciation_dict.json"
+)
+_PRONUNCIATION_CACHE: tuple[str, float, dict[str, str]] | None = None
+
+_CAPS_KEEP_ACRONYMS = {
+    'LFI', 'RN', 'PS', 'LR', 'UE', 'ONU', 'OTAN', 'USA', 'CGT', 'CFDT',
+    'SNCF', 'EDF', 'DGSE', 'DGSI', 'PFAS', 'BFMTV', 'FNSEA', 'UCL', 'RSA',
+    'SMIC', 'TVA', 'PIB', 'PMA', 'GPA', 'IVG', 'OQTF', 'ONG', 'RSF', 'OIP',
+    'AFD', 'MEDEF', 'UNESCO', 'OMS', 'FMI', 'BCE', 'INSEE', 'CNIL', 'ARCOM',
+}
 
 # --- INCLUSIVE WRITING HANDLER ---
 
@@ -506,7 +520,19 @@ def clean_text_for_tts(text: str) -> str:
     result = re.sub(r'Ne manquez plus notre newsletter[^\.!\?]*[\.!\?]?', '', result, flags=re.IGNORECASE)
     result = re.sub(r'Découvrir d[\'’]autres articles de[^\.!\?]*[\.!\?]?', '', result, flags=re.IGNORECASE)
     result = re.sub(r'Image à la Une\s*:[^\.!\?]*[\.!\?]?', '', result, flags=re.IGNORECASE)
+    result = re.sub(r'Voulez-vous plonger dans les\s+secrets de\s+fabrication[^\.!\?]*[\.!\?]?', '', result, flags=re.IGNORECASE)
+    result = re.sub(r'Rejoignez la\s+[«"].*?lettre enquête[^\.!\?]*[\.!\?]?', '', result, flags=re.IGNORECASE)
     result = re.sub(r'Version raccourcie tract\s*:.*$', '', result, flags=re.IGNORECASE | re.DOTALL)
+
+    # 6b. Supprimer les renvois purement visuels / web entre parenthèses
+    result = re.sub(
+        r'\(\s*(?:lire\s+l[\'’]intégralité[^)]{0,120}|lire\s+aussi[^)]{0,120}|'
+        r'voir\s+(?:ci-dessous|ci-dessus|encadré|annexe|plus\s+bas|plus\s+haut)[^)]{0,80}|'
+        r'ci-contre)\s*\)',
+        '',
+        result,
+        flags=re.IGNORECASE,
+    )
 
     # 7. Supprimer les sections interactives et boilerplate
     noise_cutoff_patterns = [
@@ -586,9 +612,107 @@ def clean_text_for_tts(text: str) -> str:
     return result.strip()
 
 
-def normalize_for_tts(text: str) -> str:
+def load_pronunciation_dict(path: str = _DEFAULT_PRONUNCIATION_DICT_PATH) -> dict[str, str]:
     """
-    Normalisations orthophoniques spécifiques pour fr-FR-VivienneNeural.
+    Charge un dictionnaire phonétique JSON {terme: prononciation} s'il existe.
+    Met en cache le contenu tant que la date de modification du fichier ne change pas.
+    """
+    global _PRONUNCIATION_CACHE
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        mtime = os.path.getmtime(path)
+        if _PRONUNCIATION_CACHE and _PRONUNCIATION_CACHE[0] == path and _PRONUNCIATION_CACHE[1] == mtime:
+            return _PRONUNCIATION_CACHE[2]
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        cleaned = {str(k): str(v) for k, v in raw.items() if str(k).strip()}
+        _PRONUNCIATION_CACHE = (path, mtime, cleaned)
+        return cleaned
+    except Exception as e:
+        logger.warning(f"Impossible de charger le dictionnaire phonétique {path} : {e}")
+        return {}
+
+
+def apply_pronunciation_dict(text: str, dictionary: dict[str, str] | None = None) -> str:
+    """Remplace les termes du dictionnaire phonétique par leur forme parlée (mots entiers)."""
+    mapping = load_pronunciation_dict() if dictionary is None else dictionary
+    if not mapping or not text:
+        return text
+    result = text
+    for term in sorted(mapping.keys(), key=len, reverse=True):
+        spoken = mapping[term]
+        if not term:
+            continue
+        pattern = rf'(?<![\wÀ-ÿ]){re.escape(term)}(?![\wÀ-ÿ])'
+        result = re.sub(pattern, lambda _m, s=spoken: s, result)
+    return result
+
+
+def normalize_all_caps(text: str) -> str:
+    """
+    Convertit les longues séquences tout en majuscules (>= 4 mots) en casse phrase
+    pour éviter une diction hachée, tout en préservant les sigles courants.
+    """
+    if not text:
+        return text
+
+    # Séquence de mots alphabétiques tout en majuscules (incluant élisions et traits d'union)
+    word_pat = r"(?:[A-ZÀ-Ÿ]{2,}(?:['’\-][A-ZÀ-Ÿ]+)*|[A-ZÀ-Ÿ]['’][A-ZÀ-Ÿ]+|À)"
+    seq_re = re.compile(
+        rf"{word_pat}(?:[\s,;:!\?\-–—/]+{word_pat}){{3,}}"
+    )
+
+    def _convert_span(match: re.Match) -> str:
+        span = match.group(0)
+        words = re.findall(r"[A-ZÀ-Ÿ]+", span)
+        # Éviter de toucher une liste de sigles courts (ex: "LFI, RN, PS, UE")
+        if len(words) < 4 or not any(len(w) >= 5 for w in words):
+            return span
+
+        tokens = re.split(r"([A-ZÀ-Ÿ]+)", span)
+        out = []
+        capitalize_next = True
+        for tok in tokens:
+            if not tok:
+                continue
+            if re.fullmatch(r"[A-ZÀ-Ÿ]+", tok):
+                if tok in _CAPS_KEEP_ACRONYMS:
+                    out.append(tok)
+                elif capitalize_next:
+                    out.append(tok[0].upper() + tok[1:].lower())
+                else:
+                    out.append(tok.lower())
+                capitalize_next = False
+            else:
+                out.append(tok)
+                if any(ch in tok for ch in ".!?:"):
+                    capitalize_next = True
+        return "".join(out)
+
+    return seq_re.sub(_convert_span, text)
+
+
+def format_list_item_for_tts(text: str) -> str:
+    """
+    Formate un élément de liste <li> pour une intonation naturelle :
+    termine par '.' s'il est long (> 80 car.) ou multi-phrases, sinon par ','.
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+    if cleaned[-1] in '.!?;:…':
+        return cleaned
+    if len(cleaned) > 80 or re.search(r'[.!?]\s+\S', cleaned):
+        return f"{cleaned}."
+    return f"{cleaned.rstrip('.')},"
+
+
+def normalize_for_tts(text: str, pronunciation_dict: dict[str, str] | None = None) -> str:
+    """
+    Normalisations orthophoniques spécifiques pour les voix Neural françaises.
     """
     t = text
     t = re.sub(r'\b49\.3\b', '49 3', t)
@@ -613,6 +737,7 @@ def normalize_for_tts(text: str) -> str:
 
     t = re.sub(r'(\d[\d\s,\.]*)\s*Mds?€', _replace_mde, t)
     t = re.sub(r'(\d[\d\s,\.]*)\s*k€', r'\1 mille euros', t)
+    t = apply_pronunciation_dict(t, pronunciation_dict)
     t = re.sub(r'\s+', ' ', t).strip()
     return t
 
@@ -681,6 +806,7 @@ def prepare_text_for_tts(text: str) -> str:
     t = clean_text_for_tts(t)
     t = convertir_chiffres_romains(t)
     t = process_inclusive_writing(t)
+    t = normalize_all_caps(t)
     t = normalize_for_tts(t)
     return t
 

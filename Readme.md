@@ -11,13 +11,16 @@
 
 ## ✨ Fonctionnalités
 
-- **🗣️ Synthèse Vocale Neurale (TTS)** : Utilise le moteur `edge-tts` (voix *Vivienne Neural* par défaut) pour une qualité audio quasi-humaine.
-- **📰 Mode "Reader" Robuste & Pauses Naturelles** : Génère un texte propre et structuré pour la lecture :
-    - Extraction via `Trafilatura` avec filtrage automatique du bruit (notes de bas de page, résidus de menus).
-    - Points de suspension ` ... ` forcés entre les paragraphes pour garantir la respiration du TTS.
-    - Points `.` et virgules `,` préservés pour les pauses moyennes et courtes.
+- **🗣️ Synthèse Vocale Neurale Riche ("Pseudo-SSML")** : Utilise `edge-tts` avec des voix multilingues (`fr-FR-VivienneMultilingualNeural` et `fr-FR-RemyMultilingualNeural` par défaut) pour gérer naturellement les termes étrangers, et assemble l'audio via `ffmpeg` :
+    - **Profils prosodiques par bloc** : débit, hauteur et volume adaptés selon le rôle (intro, chapô, intertitre, corps, encadré, longue citation).
+    - **Pauses inter-paragraphes gratuites** : utilise les événements `SentenceBoundary` d'`edge-tts` pour insérer une respiration exacte (`450 ms`) entre paragraphes sans appel API supplémentaire.
+    - **Format entretien 2 voix** : détecte automatiquement les interviews (questions en gras ou préfixées `Média :`) pour alterner voix journaliste / voix invité et supprimer les préfixes répétitifs.
+    - **Habillage sonore & normalisation** : légers *earcons* synthétisés par `ffmpeg`, normalisation loudness EBU R128 (`-16 LUFS`), et **chapitres MP3 (`CHAP`/`CTOC`)** navigables sur intertitres, encadrés et résumés groupés.
+    - **Mode rapide (`--fast`)** : option mono-appel sans découpage ni `ffmpeg` lorsque la vitesse prime.
+- **📰 Mode "Reader" Robuste & Nettoyage Avancé** : Génère un texte propre et structuré pour la lecture :
+    - Extraction via `Trafilatura` et adapters dédiés (chapô et encadrés `.box` Mediapart, suppression des notes de bas de page, encarts newsletter et renvois visuels).
     - **Intro Scriptée** : *"Article de [Média]... [Titre]... Par [Auteur]"*.
-    - Conversion automatique de l'**écriture inclusive** (client·e·s → "clientes et clients") et des **chiffres romains** (XIXe siècle → 19e siècle).
+    - Conversion automatique de l'**écriture inclusive** (client·e·s → "clientes et clients"), des **chiffres romains** (XIXe siècle → 19e siècle), des passages **tout en majuscules**, et dictionnaire phonétique optionnel (`pronunciation_dict.json`).
 - **🤖 Résumé IA (Gemini/Gemma)** : Option de résumé automatique des articles via l'API Gemini avant la synthèse vocale. Configurable par flux RSS. Voir la section [Configuration Gemini](#-configuration-gemini-résumé-ia).
 - **📦 Regroupement Temporel** : Les résumés d'un même flux peuvent être regroupés en un seul MP3 sur une fenêtre de temps (ex. : toute la production du jour en un seul fichier audio).
 - **🏷️ Métadonnées Enrichies (ID3)** :
@@ -34,6 +37,7 @@
 
 ### Pré-requis
 - Python 3.12 ou supérieur
+- `ffmpeg` (recommandé pour le mode audio riche : pauses inter-paragraphes, earcons, normalisation `-16 LUFS` et assemblage multi-voix ; en son absence, bascule automatique sur le mode rapide)
 - Linux (recommandé) ou macOS/Windows.
 
 ### Installation des dépendances
@@ -61,9 +65,24 @@ Les chemins et options sont définis dans `config.json` :
         "summary": "Resumes"
     },
     "archive_dir": "~/Téléchargements/versaudio/Archived",
-    "voice": "fr-FR-VivienneNeural"
+    "voice": "fr-FR-VivienneMultilingualNeural",
+    "secondary_voice": "fr-FR-RemyMultilingualNeural",
+    "audio_mode": "rich",
+    "earcons": true,
+    "loudnorm": true,
+    "inter_paragraph_pause_ms": 450,
+    "long_quote_min_chars": 180,
+    "max_tts_calls_per_article": 60
 }
 ```
+
+> **Options audio (`config.json`)** :
+> - `audio_mode` : `"rich"` (défaut, multi-voix + prosodie + `ffmpeg` + chapitres ID3) ou `"fast"` (mono-appel rapide).
+> - `secondary_voice` : voix utilisée pour l'habillage, les longues citations et les réponses d'entretien (`fr-FR-RemyMultilingualNeural`).
+> - `earcons` / `loudnorm` : active les sons de transition doux et l'égalisation à `-16 LUFS`.
+> - `inter_paragraph_pause_ms` : durée (ms) du silence inséré entre deux paragraphes d'un même bloc via `SentenceBoundary`.
+> - `max_tts_calls_per_article` : plafond d'appels `edge-tts` par article (défaut `60`, garantit < 5 min/article même sur de très longs dossiers).
+> - **Dictionnaire phonétique** : copiez `pronunciation_dict.example.json` vers `pronunciation_dict.json` pour personnaliser la prononciation de certains sigles ou noms propres.
 
 > **Note sur `output_dirs`** : Permet d'organiser les fichiers audio MP3 par source (`html`, `rss`, `summary` ou `resume`). Si un sous-dossier relatif est indiqué (ex: `"HTML"`), il sera créé automatiquement dans le `output_dir` principal. Vous pouvez également spécifier des chemins absolus (ex: `"~/Podcasts/Resumes"`). Si ce bloc n'est pas renseigné, tous les MP3 sont générés à la racine de `output_dir`.
 
@@ -141,8 +160,11 @@ Le projet maintient trois fichiers JSON à la racine (gérés automatiquement) :
 ### Lancement manuel
 
 ```bash
-# Traitement normal (HTML locaux + flux RSS)
+# Traitement normal (HTML locaux + flux RSS, mode riche par défaut)
 python3 html_to_mp3.py
+
+# Mode rapide (mono-appel edge-tts sans découpage ni ffmpeg)
+python3 html_to_mp3.py --fast
 
 # Limiter à N articles par flux (utile pour tester)
 python3 html_to_mp3.py --rss-limit 2

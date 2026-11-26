@@ -1,7 +1,8 @@
 
 from .base import BaseAdapter
-from .reader_mode import reader_extract_content, reader_extract_metadata
+from .reader_mode import reader_extract_content, reader_extract_metadata, reader_extract_segments
 from bs4 import Tag, NavigableString
+from segments import Segment, segments_to_plain_text
 import copy
 import json
 import re
@@ -118,38 +119,33 @@ class GenericAdapter(BaseAdapter):
 
         return meta
 
-    def _extract_content(self):
-        # On travaille sur une copie pour ne pas altérer la soup originale
-        # lors de l'extraction de métadonnées ou d'appels multiples
+    def _extract_segments(self) -> list[Segment]:
         soup = copy.copy(self.soup)
         html_string = str(soup)
-        
-        # 0. Essai via Reader Mode (Trafilatura) en priorité pour le Generic
-        reader_content = reader_extract_content(html_string)
-        if reader_content and len(reader_content) > 100:
-            return reader_content
 
-        # 1. Cleaning Fallback (si Reader Mode a échoué)
+        reader_segs = reader_extract_segments(html_string)
+        if reader_segs and len(segments_to_plain_text(reader_segs)) > 100:
+            return reader_segs
+
         for element in soup(["script", "style", "nav", "header", "footer", "aside", "form", "iframe", "noscript", "figure", "button", "input"]):
             element.extract()
 
         junk_selectors = [
             ".share", ".social", ".comment", ".meta", ".tags", ".banner", ".promo", ".newsletter",
-            ".navigation", ".sidebar", ".related", ".breadcrumbs", ".author-bio", ".date", 
+            ".navigation", ".sidebar", ".related", ".breadcrumbs", ".author-bio", ".date",
             "#cookie-banner", "#subscribe-modal", ".paywall", ".teaser", ".recruitment",
             ".noprint", ".hidden", ".visually-hidden", ".feed"
         ]
         for selector in junk_selectors:
             for element in soup.select(selector):
                 element.extract()
-        
-        # 2. Main Content Detection
+
         main_content = soup.find('article')
         if not main_content:
             main_content = soup.find('main')
         if not main_content:
             main_content = soup.find('div', role='main')
-            
+
         if not main_content:
             max_p_count = 0
             best_div = None
@@ -165,29 +161,9 @@ class GenericAdapter(BaseAdapter):
             main_content = soup.body
 
         if not main_content:
-            return ""
+            return []
 
-        # 3. Text Generation
-        text_parts = []
-        relevant_tags = main_content.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li'])
-        
-        for tag in relevant_tags:
-            text = tag.get_text(separator=" ", strip=True)
-            if not text: continue
-            
-            if not text[-1] in '.!?:;…':
-                text = text + '.'
+        return self._extract_segments_from_container(main_content, min_len=1)
 
-            if tag.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-                text_parts.append(f"{text}..." if not text.endswith('...') else text)
-            elif tag.name == 'p':
-                text_parts.append(text)
-            elif tag.name == 'li':
-                text_parts.append(f"{text.rstrip('.')},")
-
-        result = " ".join(text_parts)
-        result = re.sub(r'\.{5,}', '...', result)
-        result = re.sub(r'\.{2}', '.', result)
-        result = re.sub(r',\.', '.', result)
-        
-        return result
+    def _extract_content(self):
+        return segments_to_plain_text(self._extract_segments())

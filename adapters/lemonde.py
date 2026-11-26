@@ -1,6 +1,7 @@
 
 from .base import BaseAdapter
 from bs4 import Tag
+from segments import Segment, segments_to_plain_text
 import copy
 import re
 import os
@@ -92,47 +93,48 @@ class LeMondeDiplomatiqueAdapter(BaseAdapter):
 
         return meta
         
-    def _extract_content(self):
-        # Logic from original script
-        # On cherche le contenu principal avec des sélecteurs robustes
+    def _extract_segments(self) -> list[Segment]:
         main_content = self.soup.select_one("div.texte, .article-texte, #article-texte")
         chapo = self.soup.select_one("div.chapo, .article-chapo, #article-chapo")
-        
-        container = self.soup.new_tag("div")
-        
-        if chapo:
-             # On utilise copy() pour ne pas vider la soup originale
-             container.append(copy.copy(chapo))
-        
-        if main_content:
-            # On utilise copy() pour ne pas vider la soup originale
-            container.append(copy.copy(main_content))
-            
-        if not main_content and not chapo:
-            return ""
-            
-        # Clean-up inside the specific content
-        for unwanted in container.select("div.haucouter, div.contexte, div.signature, div.notes, div.reperes, div.encadre, figure, div.vignette, span.spip_note_ref, a.spip_note, sup.footnote"):
-            unwanted.decompose()
-        
-        # Pre-process: unwrap
-        while True:
-            wrapper = container.find(lambda t: t.name in ['p', 'div'] and t.find(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']))
-            if not wrapper: break
-            wrapper.unwrap()
-            
-        text_parts = []
-        # Extraction des textes des paragraphes et titres
-        for tag in container.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p']):
-            text = re.sub(r'\s+([.,;:!?])', r'\1', tag.get_text(separator=" ", strip=True))
-            if not text: continue
-            
-            if not text[-1] in '.!?:;…':
-                text = text + '.'
 
-            if tag.name.startswith('h'):
-                text_parts.append(f"{text}..." if not text.endswith('...') else text)
-            else:
-                text_parts.append(text)
-                
-        return " ".join(text_parts)
+        if not main_content and not chapo:
+            return []
+
+        segments: list[Segment] = []
+
+        if chapo:
+            chapo_copy = copy.copy(chapo)
+            for unwanted in chapo_copy.select("span.spip_note_ref, a.spip_note, sup.footnote"):
+                unwanted.decompose()
+            chapo_txt = re.sub(r'\s+([.,;:!?])', r'\1', chapo_copy.get_text(separator=" ", strip=True))
+            if chapo_txt:
+                segments.append(Segment("chapo", chapo_txt))
+
+        if main_content:
+            container = copy.copy(main_content)
+            for unwanted in container.select("div.haucouter, div.contexte, div.signature, div.notes, div.reperes, div.encadre, figure, div.vignette, span.spip_note_ref, a.spip_note, sup.footnote"):
+                unwanted.decompose()
+
+            while True:
+                wrapper = container.find(lambda t: t.name in ['p', 'div'] and t.find(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']))
+                if not wrapper:
+                    break
+                wrapper.unwrap()
+
+            for tag in container.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'blockquote', 'li']):
+                text = re.sub(r'\s+([.,;:!?])', r'\1', tag.get_text(separator=" ", strip=True))
+                if not text:
+                    continue
+                if tag.name.startswith('h'):
+                    segments.append(Segment("heading", text))
+                elif tag.name == 'blockquote':
+                    segments.append(Segment("quote_block", text))
+                elif tag.name == 'li':
+                    segments.append(Segment("list_item", text))
+                else:
+                    segments.append(Segment("paragraph", text, is_bold_question=self._is_bold_question_tag(tag, text)))
+
+        return segments
+
+    def _extract_content(self):
+        return segments_to_plain_text(self._extract_segments())

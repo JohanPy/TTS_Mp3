@@ -17,6 +17,20 @@ import urllib.request
 import urllib.error
 from summarizer import get_summarizer, SummarizationError
 from text_utils import build_article_intro, prepare_text_for_tts, strip_leading_duplicate_title, strip_markdown_for_tts
+from segments import (
+    Segment,
+    build_grouped_summary_segments,
+    coalesce_segments,
+    detect_interview_segments,
+    enrich_article_segments,
+    split_paragraphs_from_text,
+)
+from audio_builder import (
+    RichAudioConfig,
+    build_rich_audio,
+    is_ffmpeg_available,
+    write_id3_chapters,
+)
 
 import sys
 
@@ -108,9 +122,36 @@ _cfg = _load_config()
 INPUT_DIR = os.path.expanduser(_cfg.get("input_dir", "~/Téléchargements/versaudio"))
 OUTPUT_DIR = os.path.expanduser(_cfg.get("output_dir", "~/Documents/Perso/Podcasts/ArtcleTTS"))
 ARCHIVE_DIR = os.path.expanduser(_cfg.get("archive_dir", "~/Téléchargements/versaudio/Archived"))
-VOICE = _cfg.get("voice", "fr-FR-VivienneNeural")
+VOICE = _cfg.get("voice", "fr-FR-VivienneMultilingualNeural")
+SECONDARY_VOICE = _cfg.get("secondary_voice", "fr-FR-RemyMultilingualNeural")
+AUDIO_MODE = _cfg.get("audio_mode", "rich")
 CONCURRENCY_LIMIT = int(_cfg.get("concurrency_limit", 3))
 RSS_FEEDS = _cfg.get("rss_feeds", [])
+
+
+def build_rich_audio_config(primary_voice: str | None = None) -> RichAudioConfig:
+    """Construit la configuration audio riche depuis config.json."""
+    return RichAudioConfig(
+        primary_voice=primary_voice or VOICE,
+        secondary_voice=_cfg.get("secondary_voice", SECONDARY_VOICE),
+        earcons=bool(_cfg.get("earcons", True)),
+        loudnorm=bool(_cfg.get("loudnorm", True)),
+        inter_paragraph_pause_ms=int(_cfg.get("inter_paragraph_pause_ms", 450)),
+        long_quote_min_chars=int(_cfg.get("long_quote_min_chars", 180)),
+        max_tts_calls=int(_cfg.get("max_tts_calls_per_article", 60)),
+    )
+
+
+def _is_fast_mode(fast_mode: bool | None = None, feed_config: dict | None = None) -> bool:
+    """Détermine si le mode de génération rapide (mono-appel) doit être utilisé."""
+    if fast_mode is not None:
+        return bool(fast_mode)
+    if isinstance(feed_config, dict):
+        if "fast_mode" in feed_config:
+            return bool(feed_config["fast_mode"])
+        if "audio_mode" in feed_config:
+            return str(feed_config["audio_mode"]).lower() == "fast"
+    return str(_cfg.get("audio_mode", AUDIO_MODE)).lower() == "fast"
 
 # Fichiers de persistance (état local, non versionnés)
 PROCESSED_URLS_FILE = os.path.join(_BASE_DIR, "processed_urls.json")
@@ -356,7 +397,8 @@ def process_html_file_test(filepath, test_output_dir):
 
         # Generate content
         text_body = adapter.get_content()
-            
+        raw_segments = adapter.get_segments()
+
         if len(text_body) < 50:
             logger.warning(f"[TEST MODE] Skipping {filename}: content too short or empty.")
             return 
@@ -366,6 +408,17 @@ def process_html_file_test(filepath, test_output_dir):
         clean_body = strip_leading_duplicate_title(title, text_body)
 
         full_content = prepare_text_for_tts(f"{text_intro}{clean_body}")
+
+        cfg = build_rich_audio_config()
+        _, is_interview = detect_interview_segments(raw_segments)
+        enriched = enrich_article_segments(
+            raw_segments,
+            meta,
+            long_quote_min_chars=cfg.long_quote_min_chars,
+        )
+        chunks = coalesce_segments(enriched, max_tts_calls=cfg.max_tts_calls)
+        tts_calls = sum(1 for c in chunks if c.is_tts)
+        chapters = [c.chapter_title for c in chunks if c.chapter_title]
 
         # Save text content to file
         with open(txt_path, 'w', encoding='utf-8') as f:
@@ -385,6 +438,13 @@ def process_html_file_test(filepath, test_output_dir):
             f.write("-" * 80 + "\n")
             f.write(full_content)
             f.write("\n" + "-" * 80 + "\n")
+
+            f.write("\nANALYSE AUDIO RICHE (PSEUDO-SSML):\n")
+            f.write(f"  - Segments bruts extraits: {len(raw_segments)}\n")
+            f.write(f"  - Segments enrichis: {len(enriched)}\n")
+            f.write(f"  - Entretien détecté (2 voix): {'Oui' if is_interview else 'Non'}\n")
+            f.write(f"  - Appels TTS estimés (après regroupement): {tts_calls} (plafond {cfg.max_tts_calls})\n")
+            f.write(f"  - Chapitres ID3 ({len(chapters)}): {', '.join(chapters) if chapters else 'Aucun'}\n")
             
             # Write statistics
             f.write(f"\nSTATISTIQUES:\n")
@@ -462,34 +522,67 @@ def save_seen_feed(feed_url):
         logger.error(f"Failed to save seen feeds: {e}")
 
 
-async def generate_audio_from_content(meta, text_body, mp3_path, voice=VOICE):
+async def generate_audio_from_content(meta, text_body, mp3_path, voice=VOICE, segments=None, fast_mode=None):
     """
-    Generates an MP3 file from clean text and metadata, and sets ID3 tags.
+    Generates an MP3 file from clean text (or structured segments) and metadata, and sets ID3 tags.
     Returns True if generation was successful, False otherwise.
     """
     title = meta.get('title') or 'Unknown Title'
     author = meta.get('author') or 'Unknown Author'
     media = meta.get('media') or 'Unknown Media'
-    
-    # Construct intro and avoid repeating title if it opens the body
-    text_intro = build_article_intro(title, author, media)
-    clean_body = strip_leading_duplicate_title(title, text_body)
 
-    full_content = prepare_text_for_tts(f"{text_intro}{clean_body}")
+    use_fast = _is_fast_mode(fast_mode)
+    if not use_fast and not is_ffmpeg_available():
+        logger.warning("ffmpeg introuvable : bascule automatique en mode TTS rapide.")
+        use_fast = True
 
-    if len(full_content) < 50:
-        logger.warning(f"Skipping generation for '{title}': content too short or empty.")
-        return False
+    chapters: list[tuple[str, int, int]] = []
 
-    # Generate Audio
-    logger.debug(f"Generating MP3: {os.path.basename(mp3_path)}")
-    logger.debug(f"Content Preview: {full_content[:100]}...")
-    
-    try:
-        await generate_tts_file(full_content, voice, mp3_path)
-    except Exception as e:
-        logger.error(f"Failed to generate TTS audio for '{title}': {e}")
-        return False
+    if use_fast:
+        # Mode rapide : un seul appel mono-voix sans découpage ni ffmpeg
+        text_intro = build_article_intro(title, author, media)
+        clean_body = strip_leading_duplicate_title(title, text_body)
+        full_content = prepare_text_for_tts(f"{text_intro}{clean_body}")
+
+        if len(full_content) < 50:
+            logger.warning(f"Skipping generation for '{title}': content too short or empty.")
+            return False
+
+        logger.debug(f"Generating MP3 (mode rapide): {os.path.basename(mp3_path)}")
+        logger.debug(f"Content Preview: {full_content[:100]}...")
+
+        try:
+            await generate_tts_file(full_content, voice, mp3_path)
+        except Exception as e:
+            logger.error(f"Failed to generate TTS audio for '{title}': {e}")
+            return False
+    else:
+        # Mode riche : segments structurés, multi-voix, prosodie, earcons, loudnorm et chapitres ID3
+        cfg = build_rich_audio_config(primary_voice=voice)
+        base_segments = segments if segments is not None else split_paragraphs_from_text(text_body)
+        enriched = enrich_article_segments(
+            base_segments,
+            meta,
+            long_quote_min_chars=cfg.long_quote_min_chars,
+        )
+        total_chars = sum(len(s.text) for s in enriched)
+        if not enriched or total_chars < 50:
+            logger.warning(f"Skipping generation for '{title}': content too short or empty.")
+            return False
+
+        logger.debug(f"Generating MP3 (mode riche): {os.path.basename(mp3_path)} ({len(enriched)} segments)")
+        try:
+            chapters = await build_rich_audio(
+                enriched,
+                mp3_path,
+                cfg,
+                _tts_limiter,
+                max_retries=TTS_MAX_RETRIES,
+                retry_base_delay=TTS_RETRY_BASE_DELAY,
+            )
+        except Exception as e:
+            logger.error(f"Failed to generate rich TTS audio for '{title}': {e}")
+            return False
     
     # Add ID3 Tags
     try:
@@ -530,6 +623,9 @@ async def generate_audio_from_content(meta, text_body, mp3_path, voice=VOICE):
                     desc=u'Cover',
                     data=img_data
                 ))
+
+        if chapters:
+            write_id3_chapters(audio, chapters)
         
         audio.save(mp3_path)
         return True
@@ -642,7 +738,7 @@ def _build_grouped_text(media: str, date_bucket: str, entries: list) -> str:
     return " ".join(parts)
 
 
-async def flush_grouped_summaries() -> None:
+async def flush_grouped_summaries(fast_mode=None) -> None:
     """
     Génère les MP3 groupés pour toutes les fenêtres calendaires fermées
     (date_bucket strictement antérieure à aujourd'hui).
@@ -674,6 +770,11 @@ async def flush_grouped_summaries() -> None:
             logger.debug("flush_grouped_summaries : aucune fenêtre fermée à traiter.")
             return
 
+        use_fast = _is_fast_mode(fast_mode)
+        if not use_fast and not is_ffmpeg_available():
+            logger.warning("ffmpeg introuvable : bascule en mode rapide pour les résumés groupés.")
+            use_fast = True
+
         for (feed_url, date_bucket), entries in groups.items():
             media = entries[0].get("media", "Unknown Media")
             voice = entries[0].get("voice", VOICE)
@@ -689,20 +790,43 @@ async def flush_grouped_summaries() -> None:
                 f"📦 Génération MP3 groupé : {mp3_name} ({len(entries)} article(s) du {date_bucket})…"
             )
 
-            combined_text = _build_grouped_text(media, date_bucket, entries)
-            combined_text = prepare_text_for_tts(combined_text)
+            chapters: list[tuple[str, int, int]] = []
+            if use_fast:
+                combined_text = _build_grouped_text(media, date_bucket, entries)
+                combined_text = prepare_text_for_tts(combined_text)
 
-            if len(combined_text) < 20:
-                logger.warning(f"Texte groupé trop court pour {mp3_name}, ignoré.")
-                remaining.extend(entries)
-                continue
+                if len(combined_text) < 20:
+                    logger.warning(f"Texte groupé trop court pour {mp3_name}, ignoré.")
+                    remaining.extend(entries)
+                    continue
 
-            try:
-                await generate_tts_file(combined_text, voice, mp3_path)
-            except Exception as e:
-                logger.error(f"❌ Erreur TTS pour le MP3 groupé {mp3_name} : {e}")
-                remaining.extend(entries)
-                continue
+                try:
+                    await generate_tts_file(combined_text, voice, mp3_path)
+                except Exception as e:
+                    logger.error(f"❌ Erreur TTS pour le MP3 groupé {mp3_name} : {e}")
+                    remaining.extend(entries)
+                    continue
+            else:
+                grouped_segs = build_grouped_summary_segments(media, date_bucket, entries)
+                if sum(len(s.text) for s in grouped_segs) < 20:
+                    logger.warning(f"Texte groupé trop court pour {mp3_name}, ignoré.")
+                    remaining.extend(entries)
+                    continue
+
+                cfg = build_rich_audio_config(primary_voice=voice)
+                try:
+                    chapters = await build_rich_audio(
+                        grouped_segs,
+                        mp3_path,
+                        cfg,
+                        _tts_limiter,
+                        max_retries=TTS_MAX_RETRIES,
+                        retry_base_delay=TTS_RETRY_BASE_DELAY,
+                    )
+                except Exception as e:
+                    logger.error(f"❌ Erreur TTS riche pour le MP3 groupé {mp3_name} : {e}")
+                    remaining.extend(entries)
+                    continue
 
             # Tags ID3 du MP3 groupé
             try:
@@ -713,6 +837,8 @@ async def flush_grouped_summaries() -> None:
                 audio.add(TIT2(encoding=3, text=f"Résumés {media} du {date_bucket}"))
                 audio.add(TPE1(encoding=3, text="IA Résumé"))
                 audio.add(TALB(encoding=3, text=media))
+                if chapters:
+                    write_id3_chapters(audio, chapters)
                 audio.save(mp3_path)
             except Exception as e:
                 logger.warning(f"Impossible d'écrire les tags ID3 pour {mp3_name} : {e}")
@@ -724,7 +850,7 @@ async def flush_grouped_summaries() -> None:
         save_grouped_summaries(data)
 
 
-async def process_rss_feed(feed_config, processed_urls, limit=None):
+async def process_rss_feed(feed_config, processed_urls, limit=None, fast_mode=None):
     """
     Processes an RSS feed, downloading new articles and converting them to MP3.
     """
@@ -733,11 +859,13 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
         feed_voice = VOICE
         should_summarize = False
         group_window_hours = None
+        feed_fast_mode = fast_mode
     elif isinstance(feed_config, dict):
         feed_url = feed_config.get("url")
         feed_voice = feed_config.get("voice", VOICE)
         should_summarize = bool(feed_config.get("summarize", False))
         group_window_hours = feed_config.get("group_window_hours")
+        feed_fast_mode = fast_mode if fast_mode is not None else _is_fast_mode(None, feed_config)
     else:
         logger.error(f"Invalid feed configuration: {feed_config}")
         return
@@ -850,6 +978,7 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
 
             # Generate body content
             text_body = adapter.get_content()
+            article_segments = None if should_summarize else adapter.get_segments()
             if len(text_body) < 50:
                 logger.warning(f"{tag} Contenu trop court ({len(text_body)} car.), article ignoré.")
                 await save_processed_url_async(link)
@@ -899,7 +1028,14 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
 
             # Generate MP3 and save tags
             logger.info(f"{tag} 🎙️ Génération MP3 : {mp3_name}")
-            success = await generate_audio_from_content(meta, text_body, mp3_path, feed_voice)
+            success = await generate_audio_from_content(
+                meta,
+                text_body,
+                mp3_path,
+                feed_voice,
+                segments=article_segments,
+                fast_mode=feed_fast_mode,
+            )
             if success:
                 logger.info(f"{tag} ✅ MP3 généré avec succès")
                 await save_processed_url_async(link)
@@ -920,7 +1056,7 @@ async def process_rss_feed(feed_config, processed_urls, limit=None):
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def process_html_file(filepath):
+async def process_html_file(filepath, fast_mode=None):
     filename = os.path.basename(filepath)
     logger.info(f"Processing: {filename}")
 
@@ -965,13 +1101,21 @@ async def process_html_file(filepath):
 
         # Generate content
         text_body = adapter.get_content()
+        article_segments = adapter.get_segments()
             
         if len(text_body) < 50:
             logger.warning(f"Skipping {filename}: content too short or empty.")
             return 
 
         # Generate Audio and tags
-        success = await generate_audio_from_content(meta, text_body, mp3_path, VOICE)
+        success = await generate_audio_from_content(
+            meta,
+            text_body,
+            mp3_path,
+            VOICE,
+            segments=article_segments,
+            fast_mode=fast_mode,
+        )
         if not success:
             return
 
@@ -1042,10 +1186,11 @@ def main_test(test_dir):
         logger.info("=" * 80)
 
 
-async def main(rss_limit=None):
+async def main(rss_limit=None, fast_mode=None):
     start_time = time.monotonic()
     logger.info("═" * 68)
-    logger.info("🎙️  TTS_Mp3 — Démarrage de la conversion & des résumés IA")
+    mode_label = "rapide" if _is_fast_mode(fast_mode) else "riche (pseudo-SSML)"
+    logger.info(f"🎙️  TTS_Mp3 — Démarrage de la conversion [{mode_label}] & résumés IA")
     logger.info("═" * 68)
 
     # Ensure directories exist
@@ -1090,7 +1235,7 @@ async def main(rss_limit=None):
         
         async def safe_process(filepath):
             async with sem:
-                await process_html_file(filepath)
+                await process_html_file(filepath, fast_mode=fast_mode)
                 
         tasks = [safe_process(filepath) for filepath in html_files]
         await asyncio.gather(*tasks)
@@ -1104,11 +1249,11 @@ async def main(rss_limit=None):
         processed_urls = load_processed_urls()
         try:
             for feed_config in RSS_FEEDS:
-                await process_rss_feed(feed_config, processed_urls, limit=rss_limit)
+                await process_rss_feed(feed_config, processed_urls, limit=rss_limit, fast_mode=fast_mode)
         finally:
             # Générer les MP3 groupés pour les fenêtres calendaires fermées
             logger.info("📦 Vérification des résumés groupés à générer…")
-            await flush_grouped_summaries()
+            await flush_grouped_summaries(fast_mode=fast_mode)
     else:
         logger.info("📡 Aucun flux RSS configuré.")
 
@@ -1141,6 +1286,17 @@ if __name__ == "__main__":
         default=None,
         help='Limite le nombre de nouveaux articles à traiter par flux RSS (utile pour les tests).'
     )
+    parser.add_argument(
+        '--fast',
+        action='store_true',
+        help='Mode rapide : génère chaque MP3 en un seul appel edge-tts (sans découpage multi-voix ni ffmpeg).'
+    )
+    parser.add_argument(
+        '--audio-mode',
+        choices=['rich', 'fast'],
+        default=None,
+        help='Force le mode audio (rich ou fast), surchargeant audio_mode de config.json.'
+    )
     
     args = parser.parse_args()
     
@@ -1153,7 +1309,8 @@ if __name__ == "__main__":
             )
             main_test(test_dir)
         else:
+            effective_fast = True if args.fast else (args.audio_mode == 'fast' if args.audio_mode else None)
             # Normal mode: async execution
-            asyncio.run(main(rss_limit=args.rss_limit))
+            asyncio.run(main(rss_limit=args.rss_limit, fast_mode=effective_fast))
     except KeyboardInterrupt:
         logger.info("Stopped by user.")

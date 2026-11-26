@@ -1,6 +1,7 @@
 
 from .base import BaseAdapter
 from bs4 import BeautifulSoup
+from segments import Segment, segments_to_plain_text
 import re
 import os
 
@@ -104,20 +105,34 @@ class UCLAdapter(BaseAdapter):
 
         return meta
         
-    def _extract_content(self):
-        # Target .entry-content first to avoid repeating the title and capturing view counters (e.g. "557 vues").
+    @staticmethod
+    def _strip_tract_tail(segments: list[Segment]) -> list[Segment]:
+        out: list[Segment] = []
+        for seg in segments:
+            m = re.search(r'\bVersion raccourcie tract\s*:', seg.text, flags=re.IGNORECASE)
+            if m:
+                before = seg.text[:m.start()].strip()
+                if before:
+                    out.append(Segment(seg.kind, before, seg.chapter_title, seg.is_bold_question))
+                break
+            out.append(seg)
+        return out
+
+    def _extract_segments(self) -> list[Segment]:
         entry_content = self.soup.select_one(".entry-content")
         if entry_content:
             container = BeautifulSoup(str(entry_content), 'html.parser')
             for junk in container.select(".post-date, .spip_note_ref, a.spip_note, .notes, #notes"):
                 junk.extract()
-            extracted = self._reader_extract(str(container))
-            if extracted and len(extracted) >= 100:
-                extracted = re.sub(r'\s*Version raccourcie tract\s*:.*$', '', extracted, flags=re.IGNORECASE | re.DOTALL)
-                return extracted.strip()
+            segs = self._reader_extract_segments(str(container))
+            if segs and len(segments_to_plain_text(segs)) >= 100:
+                return self._strip_tract_tail(segs)
+
         clone = BeautifulSoup(str(self.soup), 'html.parser')
         for junk in clone.select(".post-date, .spip_note_ref, a.spip_note, .notes, #notes"):
             junk.extract()
-        extracted = self._reader_extract(str(clone))
-        extracted = re.sub(r'\s*Version raccourcie tract\s*:.*$', '', extracted, flags=re.IGNORECASE | re.DOTALL)
-        return extracted.strip()
+        segs = self._reader_extract_segments(str(clone))
+        return self._strip_tract_tail(segs)
+
+    def _extract_content(self):
+        return segments_to_plain_text(self._extract_segments())

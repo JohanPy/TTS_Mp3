@@ -1,4 +1,5 @@
 from .base import BaseAdapter
+from segments import Segment, segments_to_plain_text
 import re
 import os
 
@@ -71,18 +72,17 @@ class LMSIAdapter(BaseAdapter):
 
         return meta
         
-    def _extract_content(self):
-        # The main container
-        container = self.soup.select_one(".contenu-principal")
-        if not container:
-            return ""
+    def _extract_segments(self) -> list[Segment]:
+        raw_container = self.soup.select_one(".contenu-principal")
+        if not raw_container:
+            return []
 
-        # Remove junk
+        container = raw_container.__copy__()
         for el in container(["script", "style", "nav", "figure", "img", "iframe"]):
             el.extract()
-            
+
         junk_selectors = [
-            ".info-publi", ".spip_note_ref", ".notes", ".portfolio", 
+            ".info-publi", ".spip_note_ref", ".notes", ".portfolio",
             ".share", ".social", ".author", ".tags", ".related", "#forum",
             ".cartouche h1"
         ]
@@ -90,47 +90,14 @@ class LMSIAdapter(BaseAdapter):
             for el in container.select(selector):
                 el.extract()
 
-        # Unwrap wrappers to avoid missing text
         while True:
-            wrapper = container.find(lambda t: t.name in ['div', 'span'] and 
+            wrapper = container.find(lambda t: t.name in ['div', 'span'] and
                                      t.find(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']))
             if not wrapper:
                 break
             wrapper.unwrap()
 
-        # Extract text
-        text_parts = []
-        seen = set()
-        
-        for tag in container.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'blockquote', 'li']):
-            # Skip nested tags that have block children
-            if tag.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'blockquote']):
-                continue
-                
-            text = tag.get_text(separator=" ", strip=True)
-            if not text or len(text) < 15:
-                continue
-                
-            text_hash = text[:50]
-            if text_hash in seen:
-                continue
-            seen.add(text_hash)
-            
-            if not text[-1] in '.!?:;…':
-                text = text + '.'
+        return self._extract_segments_from_container(container, min_len=15, seen_dedup=True)
 
-            if tag.name.startswith('h'):
-                text_parts.append(f"{text}..." if not text.endswith('...') else text)
-            elif tag.name == 'blockquote':
-                text_parts.append(f"Citation: {text}")
-            elif tag.name == 'li':
-                text_parts.append(f"{text.rstrip('.')},")
-            else:
-                text_parts.append(text)
-
-        result = " ".join(text_parts)
-        result = re.sub(r'\.{5,}', '...', result)
-        result = re.sub(r'\.{2}', '.', result)
-        result = re.sub(r',\.', '.', result)
-        
-        return result
+    def _extract_content(self):
+        return segments_to_plain_text(self._extract_segments())
