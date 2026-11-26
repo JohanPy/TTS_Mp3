@@ -4,13 +4,21 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from bs4 import BeautifulSoup
+from adapters import get_adapter
+from adapters.arretsurimages import ArretSurImagesAdapter
+from adapters.lemonde import LeMondeDiplomatiqueAdapter
+from adapters.mediapart import MediapartAdapter
 from adapters.reader_mode import reader_extract_content
+from adapters.ucl import UCLAdapter
 from text_utils import (
+    build_article_intro,
     clean_text_for_tts,
     convertir_chiffres_romains,
     normalize_for_tts,
     prepare_text_for_tts,
     process_inclusive_writing,
+    strip_leading_duplicate_title,
 )
 
 
@@ -186,6 +194,146 @@ class TestCleanAndNormalizeTTS(unittest.TestCase):
         self.assertNotIn('""', extracted)
         self.assertNotIn('"', extracted)
         self.assertIn("un mot en gras", extracted)
+
+    def test_unicode_artifacts_and_html_spacing(self):
+        raw = (
+            "Politiser la ques\xadtion du han\xaddi\xadcap\u200b dans l’ asso "
+            "et d’ Écotransféminismes ( ableism ) avec note↩︎."
+        )
+        cleaned = clean_text_for_tts(raw)
+        self.assertNotIn('\xad', cleaned)
+        self.assertNotIn('\u200b', cleaned)
+        self.assertNotIn('↩', cleaned)
+        self.assertIn("question du handicap", cleaned)
+        self.assertIn("dans l’asso", cleaned)
+        self.assertIn("d’Écotransféminismes", cleaned)
+        self.assertIn("(ableism)", cleaned)
+
+    def test_punctuation_collisions_and_boilerplate(self):
+        raw = (
+            "Pourquoi?. Pour ça!.. Voici:. Et aussi., puis,. encore?... "
+            "557vues. à l’échelle du monde ( 9 ). "
+            "Inscrivez-vous à notre newsletter chaque semaine. "
+            "Rendez-vous sur Cooperationjackson.org/. "
+            "Cette phrase suffisamment longue décrit un fait important dans l'article. "
+            "Cette phrase suffisamment longue décrit un fait important dans l'article. "
+            "Suite du texte."
+        )
+        cleaned = clean_text_for_tts(raw)
+        for bad in ("?.", "!.", ":.", ".,", ",.", "?...", "557vues", "(9)", "Inscrivez-vous", "Cooperationjackson.org/"):
+            self.assertNotIn(bad, cleaned)
+        self.assertEqual(cleaned.count("Cette phrase suffisamment longue décrit un fait important dans l'article."), 1)
+        self.assertIn("Suite du texte.", cleaned)
+
+    def test_vocal_abbreviations_and_currency_units(self):
+        sample = "En 50 av. J.-C. et 100 ap. J.-C., cf. p. 42 et pp. 12-15, c.-à-d. vol. 3 : 2,5 Md€, 1 Md€ et 50 k€."
+        norm = normalize_for_tts(sample)
+        self.assertIn("50 avant Jésus-Christ", norm)
+        self.assertIn("100 après Jésus-Christ", norm)
+        self.assertIn("voir page 42", norm)
+        self.assertIn("pages 12-15", norm)
+        self.assertIn("c'est-à-dire", norm)
+        self.assertIn("volume 3", norm)
+        self.assertIn("2,5 milliards d'euros", norm)
+        self.assertIn("1 milliard d'euros", norm)
+        self.assertIn("50 mille euros", norm)
+
+    def test_intro_and_duplicate_title_stripping(self):
+        self.assertEqual(
+            build_article_intro("Mon titre", "Unknown Author", "Unknown Media"),
+            "Mon titre... ",
+        )
+        self.assertEqual(
+            build_article_intro("Mon titre", "Union communiste libertaire", "Union Communiste Libertaire"),
+            "Article de Union Communiste Libertaire... Mon titre... ",
+        )
+        self.assertEqual(
+            build_article_intro("Mon titre", "Jean Dupont", "Acrimed | Action Critique Médias"),
+            "Article de Acrimed... Mon titre... Par Jean Dupont... ",
+        )
+        body = "« Parlons de santé mentale » : folie douce. Les productions médiatiques sur la santé mentale se multiplient."
+        stripped = strip_leading_duplicate_title('"Parlons de santé mentale" : folie douce', body)
+        self.assertTrue(stripped.startswith("Les productions médiatiques"))
+        # Ne doit pas couper si le titre n'est que le début d'une phrase différente
+        non_dup = "La crise sociale s'aggrave dans le pays depuis plusieurs mois déjà."
+        self.assertEqual(strip_leading_duplicate_title("La crise sociale", non_dup), non_dup)
+
+
+class TestAdaptersCleanup(unittest.TestCase):
+    def test_mediapart_removes_aside_newsletter_and_highlight(self):
+        html = """
+        <html><body>
+        <div class="news__rich-text-content">
+            <p>Premier paragraphe complet de l'article Mediapart.</p>
+            <aside class="highlight"><p>Premier paragraphe complet de l'article Mediapart.</p></aside>
+            <aside><p>Inscrivez-vous à « L’éco à part » et recevez notre analyse.</p></aside>
+            <p>Deuxième paragraphe de l'article Mediapart.</p>
+        </div>
+        </body></html>
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        adapter = MediapartAdapter(soup, "mediapart.html")
+        content = adapter.get_content()
+        self.assertEqual(content.count("Premier paragraphe"), 1)
+        self.assertNotIn("Inscrivez-vous", content)
+        self.assertIn("Deuxième paragraphe", content)
+
+    def test_arretsurimages_extracts_author_from_equipe_or_title(self):
+        html_equipe = """
+        <html><head>
+            <meta property="og:site_name" content="Arrêt sur images" />
+            <meta property="og:title" content="Titre test | Arrêt sur images" />
+        </head><body>
+            <a href="/equipe/loris-guemart">Loris Guémart</a>
+        </body></html>
+        """
+        meta1 = ArretSurImagesAdapter(BeautifulSoup(html_equipe, "html.parser"), "asi.html").extract_metadata()
+        self.assertEqual(meta1["author"], "Loris Guémart")
+
+        html_title = """
+        <html><head>
+            <meta property="og:site_name" content="Arrêt sur images" />
+            <meta property="og:title" content="Sujet important - Par Pauline Bock | Arrêt sur images" />
+        </head><body></body></html>
+        """
+        meta2 = ArretSurImagesAdapter(BeautifulSoup(html_title, "html.parser"), "asi.html").extract_metadata()
+        self.assertEqual(meta2["title"], "Sujet important")
+        self.assertEqual(meta2["author"], "Pauline Bock")
+
+    def test_lemonde_removes_spip_note_ref(self):
+        html = """
+        <html><body>
+        <div class="article-texte">
+            <p>À l'échelle du monde<span class="spip_note_ref"> (<a class="spip_note" href="#nb1">9</a>)</span>.</p>
+        </div>
+        </body></html>
+        """
+        adapter = LeMondeDiplomatiqueAdapter(BeautifulSoup(html, "html.parser"), "lmd.html")
+        content = adapter.get_content()
+        self.assertNotIn("9", content)
+        self.assertIn("À l'échelle du monde.", content)
+
+    def test_ucl_does_not_hijack_basta_and_strips_views(self):
+        basta_html = """
+        <html><head><meta property="og:site_name" content="Basta!" /></head>
+        <body><h1 class="entry-title">Titre Basta</h1><span class="vcard author">Auteur</span></body></html>
+        """
+        adapter = get_adapter(BeautifulSoup(basta_html, "html.parser"), "basta.html")
+        self.assertNotIsInstance(adapter, UCLAdapter)
+
+        ucl_html = """
+        <html><head><meta property="og:url" content="https://www.unioncommunistelibertaire.org/?test" /></head>
+        <body><div class="entry-content">
+            <div class="post-date">11 octobre 2026 par AL / 557 vues</div>
+            <p>Premier vrai paragraphe de l'article UCL suffisamment long pour passer le seuil d'extraction du reader mode.</p>
+            <p>Deuxième vrai paragraphe de l'article UCL avec du contenu substantiel pour valider l'extraction.</p>
+        </div></body></html>
+        """
+        ucl_adapter = UCLAdapter(BeautifulSoup(ucl_html, "html.parser"), "ucl.html")
+        content = ucl_adapter.get_content()
+        self.assertNotIn("557", content)
+        self.assertNotIn("vues", content)
+        self.assertIn("Premier vrai paragraphe", content)
 
 
 if __name__ == "__main__":

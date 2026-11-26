@@ -220,17 +220,17 @@ class CairnAdapter(BaseAdapter):
                 continue
             seen_texts.add(text_hash)
                 
-            if not text[-1] in '.!?':
+            if not text[-1] in '.!?:;…':
                 text = text + '.'
-                
+
             if tag.name.startswith('h'):
-                text_parts.append(f"{text}...")
+                text_parts.append(f"{text}..." if not text.endswith('...') else text)
             elif tag.name == 'blockquote':
                 text_parts.append(f"Citation: {text}")
             elif tag.name == 'li':
-                text_parts.append(f"{text},")
+                text_parts.append(f"{text.rstrip('.')},")
             else:
-                text_parts.append(f"{text}.")
+                text_parts.append(text)
 
         result = " ".join(text_parts)
         # Clean up multiple dots

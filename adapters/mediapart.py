@@ -1,6 +1,6 @@
 
 from .base import BaseAdapter
-from bs4 import Tag
+from bs4 import BeautifulSoup, Tag
 import re
 import os
 
@@ -85,10 +85,12 @@ class MediapartAdapter(BaseAdapter):
         return meta
         
     def _extract_content(self):
-        main_content = self.soup.select_one("div.news__rich-text-content, div.content-page__full")
+        raw_main = self.soup.select_one("div.news__rich-text-content, div.content-page__full")
         
-        if not main_content:
+        if not raw_main:
             return ""
+
+        main_content = BeautifulSoup(str(raw_main), 'html.parser')
 
         # Handle dropcaps: they have a visual part (aria-hidden) and a reader part (screen-reader-only)
         # We want to keep the reader part and remove the visual part to avoid fragmented reading.
@@ -103,10 +105,16 @@ class MediapartAdapter(BaseAdapter):
             if reader_part:
                 reader_part.unwrap()
 
-        # Remove "À lire aussi" blocks, accessibility hidden text, and other noise
+        # Remove "À lire aussi" blocks, accessibility hidden text, pull-quotes (highlight), footnotes and newsletter asides
         # Note: Do NOT remove dropcap-wrapper as it contains the first paragraph text
-        for node in main_content.select(".lire-aussi, .r-interne, .read-also, .screen-reader-only, figure"): 
+        for node in main_content.select(".lire-aussi, .r-interne, .read-also, .screen-reader-only, figure, aside.highlight, span.spip_note_ref, a.spip_note, sup.footnote"):
             node.extract()
+
+        for aside in main_content.find_all("aside"):
+            aside_classes = aside.get("class") or []
+            aside_text = aside.get_text(" ", strip=True)
+            if "highlight" in aside_classes or not aside_classes or re.search(r'inscrivez-vous|newsletter', aside_text, re.IGNORECASE):
+                aside.extract()
             
         # Identify paragraphs and headings
         # Handling nested paragraphs: Mediapart HTML can be very messy with <p> inside <p>.
@@ -130,22 +138,22 @@ class MediapartAdapter(BaseAdapter):
         text_parts = []
         
         for tag in top_level_tags:
-            text = tag.get_text(separator=" ", strip=True)
+            text = re.sub(r'\s+([.,;:!?])', r'\1', tag.get_text(separator=" ", strip=True))
              
             if "À lire aussi" in text and len(text) < 50:
                 continue
                 
             if not text: continue
             
-            if not text[-1] in '.!?':
+            if not text[-1] in '.!?:;…':
                 text = text + '.'
-                
+
             if tag.name.startswith('h'):
-                text_parts.append(f"{text}...")
+                text_parts.append(text if text[-1] in '?!' else (f"{text}..." if not text.endswith('...') else text))
             elif tag.name == 'li':
-                 text_parts.append(f"{text},")
+                text_parts.append(text if text[-1] in '.!?;:' else f"{text},")
             else:
-                text_parts.append(f"{text}.")
+                text_parts.append(text)
                 
         return " ".join(text_parts)
 

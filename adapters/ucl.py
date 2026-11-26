@@ -1,14 +1,23 @@
 
 from .base import BaseAdapter
+from bs4 import BeautifulSoup
 import re
 import os
 
 class UCLAdapter(BaseAdapter):
     def can_handle(self):
         # Union Communiste Libertaire
-        if "Union communiste libertaire" in self.soup.get_text():
+        meta_url = self.soup.find("meta", property="og:url") or self.soup.find("link", rel="canonical")
+        if meta_url:
+            url_val = meta_url.get("content", meta_url.get("href", "")).lower()
+            if "unioncommunistelibertaire.org" in url_val:
+                return True
+        og_site = self.soup.find("meta", property="og:site_name")
+        if og_site and "union communiste libertaire" in og_site.get("content", "").lower():
             return True
-        if self.soup.select_one(".entry-title") and self.soup.select_one(".vcard.author"):
+        if self.soup.title and self.soup.title.string and "union communiste libertaire" in self.soup.title.string.lower():
+            return True
+        if "Union communiste libertaire" in self.soup.get_text():
             return True
         return False
 
@@ -96,8 +105,19 @@ class UCLAdapter(BaseAdapter):
         return meta
         
     def _extract_content(self):
-        # reader_mode (Trafilatura) provides an excellent extraction for UCL articles.
-        # It successfully captures all text, formats headers correctly, and avoids duplicates.
-        # We rely entirely on it for content extraction while keeping this adapter
-        # for its accurate Custom Metadata logic (like specific media name and author location).
-        return self._reader_extract()
+        # Target .entry-content first to avoid repeating the title and capturing view counters (e.g. "557 vues").
+        entry_content = self.soup.select_one(".entry-content")
+        if entry_content:
+            container = BeautifulSoup(str(entry_content), 'html.parser')
+            for junk in container.select(".post-date, .spip_note_ref, a.spip_note, .notes, #notes"):
+                junk.extract()
+            extracted = self._reader_extract(str(container))
+            if extracted and len(extracted) >= 100:
+                extracted = re.sub(r'\s*Version raccourcie tract\s*:.*$', '', extracted, flags=re.IGNORECASE | re.DOTALL)
+                return extracted.strip()
+        clone = BeautifulSoup(str(self.soup), 'html.parser')
+        for junk in clone.select(".post-date, .spip_note_ref, a.spip_note, .notes, #notes"):
+            junk.extract()
+        extracted = self._reader_extract(str(clone))
+        extracted = re.sub(r'\s*Version raccourcie tract\s*:.*$', '', extracted, flags=re.IGNORECASE | re.DOTALL)
+        return extracted.strip()

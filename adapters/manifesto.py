@@ -165,7 +165,8 @@ class ManifestoAdapter(BaseAdapter):
             ".elementor-widget-theme-post-featured-image",
             ".elementor-widget-post-navigation",
             "[class*='share']", "[class*='social']",
-            ".jet-listing-dynamic-link", ".elementor-icon-list"
+            ".jet-listing-dynamic-link", ".elementor-icon-list",
+            ".elementor-widget-form", ".footnotes", "a[href^='#fn']", "sup.footnote"
         ]
         for selector in junk_selectors:
             for element in container.select(selector):
@@ -203,24 +204,26 @@ class ManifestoAdapter(BaseAdapter):
             # Skip very short text
             if len(text) < 15:
                 continue
-            
+            if re.match(r'^(?:Ne manquez plus notre Newsletter|Articles en lien|Image à la Une\s*:)', text, re.IGNORECASE):
+                continue
+
             # Skip duplicates
             text_hash = text[:50]
             if text_hash in seen_texts:
                 continue
             seen_texts.add(text_hash)
-                
-            if not text[-1] in '.!?':
+
+            if not text[-1] in '.!?:;…':
                 text = text + '.'
-                
+
             if tag.name.startswith('h'):
-                text_parts.append(f"{text}...")
+                text_parts.append(f"{text}..." if not text.endswith('...') else text)
             elif tag.name == 'blockquote':
                 text_parts.append(f"Citation: {text}")
             elif tag.name == 'li':
-                text_parts.append(f"{text},")
+                text_parts.append(f"{text.rstrip('.')},")
             else:
-                text_parts.append(f"{text}.")
+                text_parts.append(text)
 
         result = " ".join(text_parts)
         # Clean up multiple dots

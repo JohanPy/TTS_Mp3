@@ -175,15 +175,15 @@ class GenericAdapter(BaseAdapter):
             text = tag.get_text(separator=" ", strip=True)
             if not text: continue
             
-            if not text[-1] in '.!?':
+            if not text[-1] in '.!?:;…':
                 text = text + '.'
-            
+
             if tag.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-                text_parts.append(f"{text}...")
+                text_parts.append(f"{text}..." if not text.endswith('...') else text)
             elif tag.name == 'p':
-                text_parts.append(f"{text}.")
+                text_parts.append(text)
             elif tag.name == 'li':
-                text_parts.append(f"{text},")
+                text_parts.append(f"{text.rstrip('.')},")
 
         result = " ".join(text_parts)
         result = re.sub(r'\.{5,}', '...', result)

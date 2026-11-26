@@ -16,7 +16,7 @@ from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, COMM, USLT, TDRC, APIC
 import urllib.request
 import urllib.error
 from summarizer import get_summarizer, SummarizationError
-from text_utils import prepare_text_for_tts, strip_markdown_for_tts
+from text_utils import build_article_intro, prepare_text_for_tts, strip_leading_duplicate_title, strip_markdown_for_tts
 
 import sys
 
@@ -361,14 +361,11 @@ def process_html_file_test(filepath, test_output_dir):
             logger.warning(f"[TEST MODE] Skipping {filename}: content too short or empty.")
             return 
 
-        # Construct intro
-        text_intro = (
-            f"Article de {media}... "
-            f"{title}... "
-            f"Par {author}... "
-        )
+        # Construct intro and avoid repeating title if it opens the body
+        text_intro = build_article_intro(title, author, media)
+        clean_body = strip_leading_duplicate_title(title, text_body)
 
-        full_content = prepare_text_for_tts(f"{text_intro}{text_body}")
+        full_content = prepare_text_for_tts(f"{text_intro}{clean_body}")
 
         # Save text content to file
         with open(txt_path, 'w', encoding='utf-8') as f:
@@ -474,14 +471,11 @@ async def generate_audio_from_content(meta, text_body, mp3_path, voice=VOICE):
     author = meta.get('author') or 'Unknown Author'
     media = meta.get('media') or 'Unknown Media'
     
-    # Construct intro
-    text_intro = (
-        f"Article de {media}... "
-        f"{title}... "
-        f"Par {author}... "
-    )
+    # Construct intro and avoid repeating title if it opens the body
+    text_intro = build_article_intro(title, author, media)
+    clean_body = strip_leading_duplicate_title(title, text_body)
 
-    full_content = prepare_text_for_tts(f"{text_intro}{text_body}")
+    full_content = prepare_text_for_tts(f"{text_intro}{clean_body}")
 
     if len(full_content) < 50:
         logger.warning(f"Skipping generation for '{title}': content too short or empty.")

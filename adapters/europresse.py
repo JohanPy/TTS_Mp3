@@ -60,12 +60,12 @@ class EuropresseAdapter(BaseAdapter):
             text = tag.get_text(separator=" ", strip=True)
             if not text: continue
             
-            if not text[-1] in '.!?':
+            if not text[-1] in '.!?:;…':
                 text = text + '.'
-            
+
             if tag.name.startswith('h'):
-                text_parts.append(f"{text}...")
+                text_parts.append(f"{text}..." if not text.endswith('...') else text)
             else:
-                text_parts.append(f"{text}.")
+                text_parts.append(text)
                 
         return " ".join(text_parts)

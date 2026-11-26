@@ -429,17 +429,46 @@ _TECH_WHITELIST = {
 }
 
 
+def _deduplicate_consecutive_sentences(text: str) -> str:
+    """Supprime les phrases consécutives identiques (> 40 caractères) issues d'exergues/encarts."""
+    segments = re.split(r'(?<=[\.!\?…])\s+', text)
+    if len(segments) <= 1:
+        return text
+
+    kept = []
+    prev_norm = None
+    for seg in segments:
+        norm = re.sub(r'[\W_]+', ' ', seg.lower()).strip()
+        if len(norm) > 40 and norm == prev_norm:
+            continue
+        kept.append(seg)
+        if len(norm) > 40:
+            prev_norm = norm
+    return " ".join(kept)
+
+
 def clean_text_for_tts(text: str) -> str:
     """
     Nettoie le texte pour la synthèse vocale en supprimant:
+    - Caractères invisibles, tirets conditionnels, puces décoratives
     - URLs, DOI, notes de bas de page, bibliographie
-    - Sections interactives et boilerplate
+    - Sections interactives, compteurs de vues, boilerplate et collisions de ponctuation
     """
     result = text
 
-    # 1. Supprimer les URLs (http://, https://, www.)
-    result = re.sub(r'https?://[^\s\)]+', '', result)
-    result = re.sub(r'www\.[^\s\)]+', '', result)
+    # 0. Supprimer les caractères invisibles / tirets conditionnels (\xad) et normaliser espaces/tirets insécables
+    result = re.sub(r'[\u00ad\u200b\u200c\u200d\u2060\ufeff\ufe0e\ufe0f\u21a9\ufffd]', '', result)
+    result = result.replace('\u00a0', ' ').replace('\u202f', ' ').replace('\u2011', '-')
+    result = re.sub(r'[►▸▪●★☆✓✔✗✘➤➔→⇒◆◇■□]', ' ', result)
+
+    # 1. Supprimer les URLs (http://, https://, www.) et URLs nues avec slash (en préservant la ponctuation finale)
+    def _strip_url_keep_punct(match):
+        tok = match.group(0)
+        return tok[-1] if tok and tok[-1] in '.,;:!?' else ''
+
+    result = re.sub(r'https?://[^\s\)]+', _strip_url_keep_punct, result)
+    result = re.sub(r'www\.[^\s\)]+', _strip_url_keep_punct, result)
+    result = re.sub(r'\b[A-Za-z0-9-]+\.(?:org|com|fr|net|eu|io)/[^\s\)]*', _strip_url_keep_punct, result)
 
     # 2. Supprimer les DOI
     result = re.sub(r'doi\.org/[^\s\)]+', '', result)
@@ -464,9 +493,20 @@ def clean_text_for_tts(text: str) -> str:
     result = re.sub(r'consulté le \d+[^\.]+\.', '', result, flags=re.IGNORECASE)
     result = re.sub(r'URL\s*:', '', result, flags=re.IGNORECASE)
 
-    # 6. Supprimer les mentions "Paru dans..." "Articles du même auteur"
+    # 6. Supprimer les mentions "Paru dans..." "Articles du même auteur" et bruit éditorial résiduel
     result = re.sub(r'Paru dans[^\.]+\.', '', result, flags=re.IGNORECASE)
     result = re.sub(r'Articles? du même auteur\.?', '', result, flags=re.IGNORECASE)
+    result = re.sub(r'\b\d+\s*vues?\b\.{0,3}', '', result, flags=re.IGNORECASE)
+    result = re.sub(
+        r'Inscrivez-vous à\s+[^\.!\?]{0,140}(?:newsletter|lettre|semaine|jours|mercredi)[^\.!\?]*[\.!\?]?',
+        '',
+        result,
+        flags=re.IGNORECASE,
+    )
+    result = re.sub(r'Ne manquez plus notre newsletter[^\.!\?]*[\.!\?]?', '', result, flags=re.IGNORECASE)
+    result = re.sub(r'Découvrir d[\'’]autres articles de[^\.!\?]*[\.!\?]?', '', result, flags=re.IGNORECASE)
+    result = re.sub(r'Image à la Une\s*:[^\.!\?]*[\.!\?]?', '', result, flags=re.IGNORECASE)
+    result = re.sub(r'Version raccourcie tract\s*:.*$', '', result, flags=re.IGNORECASE | re.DOTALL)
 
     # 7. Supprimer les sections interactives et boilerplate
     noise_cutoff_patterns = [
@@ -486,8 +526,9 @@ def clean_text_for_tts(text: str) -> str:
         if m:
             result = result[:m.start()]
 
-    # 8. Appels de notes numériques entre crochets [1], [ 12 ], [1, 2], [1-3]
+    # 8. Appels de notes numériques entre crochets [1], [ 12 ], [1, 2], [1-3] ou parenthèses isolées ( 9 ).
     result = re.sub(r'\[\s*\d+(?:\s*[-–,]\s*\d+)*\s*\]', '', result)
+    result = re.sub(r'(?<=\S)\s*\(\s*\d{1,2}\s*\)(?=\s*[\.,;:!?—–\-])', '', result)
 
     # 9. Ellipses entre crochets […] ou [.] -> ...
     result = re.sub(r'\[\s*(?:…|\.{2,3}|\.)\s*\]', '...', result)
@@ -509,22 +550,38 @@ def clean_text_for_tts(text: str) -> str:
 
     result = re.sub(r'\b([a-zà-ÿ]{4,})\d{1,2}(?=[\.,;:!?])', _strip_footnote_digit, result)
 
-    # 13. Réduire les guillemets doublés/triplés
+    # 13. Réduire les guillemets doublés/triplés et corriger espaces après apostrophes / dans parenthèses
     result = re.sub(r'"{2,}', '"', result)
+    result = re.sub(r'\(\s+', '(', result)
+    result = re.sub(r'\s+\)', ')', result)
+    result = re.sub(
+        r"\b(l|d|qu|n|s|j|c|m|t|jusqu|lorsqu|puisqu|aujourd|presqu|quelqu)(['’])\s+(?=[A-Za-zÀ-ÿ])",
+        r"\1\2",
+        result,
+        flags=re.IGNORECASE,
+    )
 
-    # 14. Nettoyer les doubles espaces et ponctuation orpheline (en préservant les points de suspension ...)
+    # 14. Nettoyer les doubles espaces et collisions de ponctuation (en préservant ...)
     result = re.sub(r'\s+', ' ', result)
     result = re.sub(r'\s+([.,;:!?])', r'\1', result)
+    result = re.sub(r'([?!])\s*\.+', r'\1', result)
+    result = re.sub(r'([,:;])\s*\.+', r'\1', result)
+    result = re.sub(r'\.{3}\s*[,:;]', '...', result)
+    result = re.sub(r'(?<!\.)\.\s*([,:;])', r'\1', result)
+    result = re.sub(r'([?!])\s*,', r'\1', result)
     result = re.sub(r'([,;:!?])\s*\1+', r'\1', result)
+    result = re.sub(r'\.\s+\.\.\.', '...', result)
+    result = re.sub(r'\.\.\.\s+\.', '...', result)
     result = re.sub(r'\.\s+\.', '.', result)
     result = re.sub(r'\.{4,}', '...', result)
     result = re.sub(r'(?<!\.)\.{2}(?!\.)', '.', result)
     result = re.sub(r'\(\s*\)', '', result)
     result = re.sub(r'\[\s*\]', '', result)
 
-    # 15. Nettoyer les espaces avant ponctuation
+    # 15. Nettoyer les espaces avant ponctuation et dédupliquer phrases consécutives
     result = re.sub(r'\s+\.', '.', result)
     result = re.sub(r'\s+,', ',', result)
+    result = _deduplicate_consecutive_sentences(result.strip())
 
     return result.strip()
 
@@ -541,8 +598,79 @@ def normalize_for_tts(text: str) -> str:
     t = re.sub(r'\bH\s+2\s*O\b', 'H2O', t)
     t = re.sub(r'\b(\d+)\s+°', r'\1°', t)
     t = re.sub(r'\bet/ou\b', 'et ou', t, flags=re.IGNORECASE)
+    t = re.sub(r'\bav\.\s*J\.-C\.?', 'avant Jésus-Christ', t)
+    t = re.sub(r'\bap\.\s*J\.-C\.?', 'après Jésus-Christ', t)
+    t = re.sub(r'\bpp\.\s*(\d+(?:\s*[-–à]\s*\d+)?)', r'pages \1', t)
+    t = re.sub(r'\bp\.\s*(\d+)', r'page \1', t)
+    t = re.sub(r'\bcf\.\s*', 'voir ', t, flags=re.IGNORECASE)
+    t = re.sub(r'\bc\.-à-d\.?', "c'est-à-dire", t, flags=re.IGNORECASE)
+    t = re.sub(r'\bvol\.\s*(\d+)', r'volume \1', t, flags=re.IGNORECASE)
+
+    def _replace_mde(match):
+        num = match.group(1).strip()
+        unit = "milliard d'euros" if num == "1" else "milliards d'euros"
+        return f"{num} {unit}"
+
+    t = re.sub(r'(\d[\d\s,\.]*)\s*Mds?€', _replace_mde, t)
+    t = re.sub(r'(\d[\d\s,\.]*)\s*k€', r'\1 mille euros', t)
     t = re.sub(r'\s+', ' ', t).strip()
     return t
+
+
+def build_article_intro(title: str, author: str = "", media: str = "") -> str:
+    """
+    Construit une introduction audio propre sans mention 'Unknown' ni répétition média/auteur.
+    """
+    clean_media = (media or "").strip()
+    if not clean_media or clean_media == "Unknown Media":
+        clean_media = ""
+    elif "|" in clean_media:
+        clean_media = clean_media.split("|", 1)[0].strip()
+
+    clean_author = (author or "").strip()
+    if not clean_author or clean_author == "Unknown Author":
+        clean_author = ""
+    elif clean_media and clean_author.lower() == clean_media.lower():
+        clean_author = ""
+
+    clean_title = (title or "").strip()
+    if not clean_title or clean_title == "Unknown Title":
+        clean_title = ""
+
+    parts = []
+    if clean_media:
+        parts.append(f"Article de {clean_media}... ")
+    if clean_title:
+        parts.append(f"{clean_title}... ")
+    if clean_author:
+        parts.append(f"Par {clean_author}... ")
+    return "".join(parts)
+
+
+def strip_leading_duplicate_title(title: str, text_body: str) -> str:
+    """
+    Retire le titre s'il est répété en tête du corps de l'article.
+    """
+    if not title or not text_body or title.strip() == "Unknown Title":
+        return text_body
+
+    words = re.findall(r'\w+', title, flags=re.UNICODE)
+    if len(" ".join(words)) < 10:
+        return text_body
+
+    pattern = (
+        r'^[\s"«“\'’\(]*'
+        + r'[\W_]+'.join(re.escape(w) for w in words)
+        + r'(?:[\s"»”\'’\)]*[\.\!\?:;…\-–—]+|[\s"»”\'’\)]*$)'
+    )
+    m = re.match(pattern, text_body, flags=re.IGNORECASE)
+    if not m:
+        return text_body
+
+    remainder = text_body[m.end():].strip()
+    if len(remainder) >= 30:
+        return remainder
+    return text_body
 
 
 def prepare_text_for_tts(text: str) -> str:

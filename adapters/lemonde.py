@@ -112,7 +112,7 @@ class LeMondeDiplomatiqueAdapter(BaseAdapter):
             return ""
             
         # Clean-up inside the specific content
-        for unwanted in container.select("div.haucouter, div.contexte, div.signature, div.notes, div.reperes, div.encadre, figure, div.vignette"):
+        for unwanted in container.select("div.haucouter, div.contexte, div.signature, div.notes, div.reperes, div.encadre, figure, div.vignette, span.spip_note_ref, a.spip_note, sup.footnote"):
             unwanted.decompose()
         
         # Pre-process: unwrap
@@ -124,15 +124,15 @@ class LeMondeDiplomatiqueAdapter(BaseAdapter):
         text_parts = []
         # Extraction des textes des paragraphes et titres
         for tag in container.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p']):
-            text = tag.get_text(separator=" ", strip=True)
+            text = re.sub(r'\s+([.,;:!?])', r'\1', tag.get_text(separator=" ", strip=True))
             if not text: continue
             
-            if not text[-1] in '.!?':
+            if not text[-1] in '.!?:;…':
                 text = text + '.'
-                
+
             if tag.name.startswith('h'):
-                text_parts.append(f"{text}...")
+                text_parts.append(f"{text}..." if not text.endswith('...') else text)
             else:
-                text_parts.append(f"{text}.")
+                text_parts.append(text)
                 
         return " ".join(text_parts)

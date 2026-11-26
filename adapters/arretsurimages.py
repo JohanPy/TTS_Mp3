@@ -24,10 +24,15 @@ class ArretSurImagesAdapter(BaseAdapter):
         soup = self.soup
         
         # Title
+        author_from_title = None
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
             title = og_title["content"].strip()
             title = re.sub(r'\s*\|\s*Arrêt sur images\s*$', '', title, flags=re.IGNORECASE)
+            par_match = re.search(r'\s*[-–]\s*Par\s+(.+)$', title, flags=re.IGNORECASE)
+            if par_match:
+                author_from_title = par_match.group(1).strip()
+                title = title[:par_match.start()].strip()
             meta["title"] = title
 
         # Author
@@ -38,14 +43,16 @@ class ArretSurImagesAdapter(BaseAdapter):
             author = meta_author["content"].strip()
             
         if not author:
-            # Often the author is in .author-name
-            author_el = soup.select_one(".author-name, .chronic-author")
-            if author_el:
-                # E.g. "Pauline Bock@PaulineBock" -> "Pauline Bock", but we can just clean the @
+            # Often the author is in .author-name (the first match may be empty, so pick the first non-empty)
+            for author_el in soup.select(".author-name, .chronic-author, a[href*='/equipe/'], a[href*='/chroniqueurs/']"):
                 text = author_el.get_text(separator=" ", strip=True)
-                # Split at @ in case there's a Twitter handle appended
                 text = text.split("@")[0].strip()
-                author = text
+                if text:
+                    author = text
+                    break
+
+        if not author and author_from_title:
+            author = author_from_title
                 
         if author:
             meta["author"] = author

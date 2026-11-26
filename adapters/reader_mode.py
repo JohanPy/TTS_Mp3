@@ -54,8 +54,14 @@ def reader_extract_content(html_string):
             # Remove academic footnotes (e.g., [1], [ 2 ], [12]) safely anywhere in the text
             line = re.sub(r'\[\s*\d{1,3}\s*\]', '', line)
             
-            # Remove standalone numbers or very short standalone references
-            if re.match(r'^\d+$', line) or (len(line) < 20 and re.match(r'^(sources?|bibliographie|notes?)[s\s:.]*$', line, re.IGNORECASE)):
+            # Remove standalone numbers, view counters, or UI boilerplate lines
+            if re.match(r'^\d+$', line) or re.match(r'^\d+\s*vues?\.?$', line, re.IGNORECASE):
+                continue
+            if len(line) < 40 and re.match(
+                r'^(?:sources?|bibliographie|notes?|partager|imprimer|articles?\s+en\s+lien|sur\s+le\s+même\s+sujet|ne\s+manquez\s+plus\s+notre\s+newsletter|version\s+raccourcie\s+tract)[s\s:.]*$',
+                line,
+                re.IGNORECASE,
+            ):
                 continue
             
             # Remove list item markers but keep the content and add a pause
@@ -84,15 +90,14 @@ def reader_extract_content(html_string):
                     
             text_parts.append(line)
             
-        # Join with explicitly long pauses between distinct paragraphs/lines
-        # The ' ... ' ensures the TTS engine breathes between blocks
-        result = " ... ".join(text_parts)
-        
-        # Clean up excessive punctuation that might have been created
-        result = re.sub(r'\.{5,}', '...', result)
-        result = re.sub(r'\.{2}', '.', result)
-        result = re.sub(r' \.\.\. \.', ' ... ', result)
-        result = re.sub(r',\.', '.', result)
+        # Join blocks with a single space (short heading lines already carry '...')
+        result = " ".join(text_parts)
+
+        # Clean up excessive punctuation or collisions that might have been created
+        result = re.sub(r'\.{4,}', '...', result)
+        result = re.sub(r'([?!])\s*\.+', r'\1', result)
+        result = re.sub(r'([,:;])\s*\.+', r'\1', result)
+        result = re.sub(r'(?<!\.)\.{2}(?!\.)', '.', result)
         
         return result
         
