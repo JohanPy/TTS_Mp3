@@ -474,6 +474,26 @@ class TestSummarizeErrorHandling(unittest.TestCase):
 
         self.assertEqual(sleep_delays, [5.0, 10.0, 20.0, 120.0])
 
+    def test_http_503_uses_longer_overload_backoff_and_releases_tpm(self):
+        """HTTP 503 utilise les délais de surcharge (15, 30, 60, 120s) et libère les tokens TPM."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 503
+        mock_resp.text = "UNAVAILABLE"
+
+        article = "Texte original de l'article avec suffisamment de texte pour dépasser les 50 caractères requis."
+        sleep_delays = []
+
+        def fake_sleep(duration):
+            sleep_delays.append(duration)
+
+        with patch("requests.post", return_value=mock_resp), \
+             patch("time.sleep", side_effect=fake_sleep):
+            with self.assertRaises(SummarizationError):
+                _run(self._summarizer.summarize(article))
+
+        self.assertEqual(sleep_delays, [15.0, 30.0, 60.0, 120.0])
+        self.assertTrue(all(tokens == 0 for _, tokens in self._summarizer._token_history))
+
 
 class TestSingleton(unittest.TestCase):
     """Tests du singleton get_summarizer()."""

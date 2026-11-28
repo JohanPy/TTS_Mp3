@@ -39,6 +39,8 @@ DEFAULT_TIMEOUT_SECONDS = 180
 RETRY_BASE_DELAY = 5.0
 # Délai avant la dernière tentative (secondes, 2 minutes)
 RETRY_LAST_DELAY = 120.0
+# Délais progressifs spécifiques en cas de surcharge serveur (HTTP 503)
+RETRY_OVERLOAD_DELAYS = (15.0, 30.0, 60.0, 120.0)
 # Nombre maximum de tentatives (1 essai initial + N-1 répétitions)
 MAX_RETRIES = 5
 # Codes HTTP transitoires qui méritent un retry
@@ -318,6 +320,9 @@ class GeminiSummarizer:
             try:
                 response = requests.post(url, params=params, json=body, timeout=self._timeout)
             except Exception as e:
+                if token_entry is not None:
+                    with self._state_lock:
+                        token_entry[1] = 0
                 last_exc = e
                 if attempt < MAX_RETRIES:
                     wait = RETRY_LAST_DELAY if attempt == MAX_RETRIES - 1 else RETRY_BASE_DELAY * (2 ** (attempt - 1))
@@ -329,8 +334,15 @@ class GeminiSummarizer:
                 continue
 
             if response.status_code != 200:
+                if response.status_code >= 500 and token_entry is not None:
+                    # Les erreurs serveur (503, 500, etc.) ne consomment pas le quota TPM
+                    with self._state_lock:
+                        token_entry[1] = 0
                 if response.status_code in RETRYABLE_STATUS and attempt < MAX_RETRIES:
-                    wait = RETRY_LAST_DELAY if attempt == MAX_RETRIES - 1 else RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    if response.status_code == 503:
+                        wait = RETRY_OVERLOAD_DELAYS[min(attempt - 1, len(RETRY_OVERLOAD_DELAYS) - 1)]
+                    else:
+                        wait = RETRY_LAST_DELAY if attempt == MAX_RETRIES - 1 else RETRY_BASE_DELAY * (2 ** (attempt - 1))
                     logger.warning(
                         f"Gemma tentative {attempt}/{MAX_RETRIES}{tag} — HTTP {response.status_code}. "
                         f"Nouvelle tentative dans {wait:.0f}s…"
